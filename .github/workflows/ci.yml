@@ -1,0 +1,97 @@
+name: CI
+
+# Reproducible checks for the Remote Control contribution. The offline suites run
+# against a fake PyQt5 shim, so no display, hardware, or real PyQt5 is needed. The
+# opt-in live/hardware tests are not run here (they require a running mesoSPIM).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Pin the upstream integration base so the patch is validated against the exact
+# commit it targets. Keep this in sync with pull_request/README.md and INTEGRATION.md.
+env:
+  UPSTREAM_REPO: mesoSPIM/mesoSPIM-control
+  UPSTREAM_COMMIT: b3c9638acb9c15394d4e371cb44e916a2f2e9664
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r pull_request/requirements-dev.txt
+      - name: Ruff (F, E9, comparison mistakes)
+        run: python -m ruff check .
+      - name: Production module formatting
+        run: >-
+          python -m ruff format --check
+          impl/mesoSPIM/src/mesoSPIM_RemoteControl_Config.py
+          impl/mesoSPIM/src/mesoSPIM_RemoteControl_Dispatcher.py
+          impl/mesoSPIM/src/mesoSPIM_RemoteControl_Commands.py
+          impl/mesoSPIM/src/mesoSPIM_RemoteControl_Servers.py
+          impl/mesoSPIM/src/mesoSPIM_RemoteControl_GUI.py
+
+  impl-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r pull_request/requirements-dev.txt
+      - name: impl unit + coverage suite
+        working-directory: impl
+        run: python -m pytest tests -q
+
+  pull-request-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [patch, source]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r pull_request/requirements-dev.txt
+      - name: pull_request suite (${{ matrix.mode }} mode)
+        working-directory: pull_request
+        env:
+          # source mode loads the modules from impl/; patch mode extracts them from the shipped patch.
+          MESOSPIM_RC_SOURCE_ROOT: ${{ matrix.mode == 'source' && format('{0}/impl', github.workspace) || '' }}
+        run: python -m pytest tests -q
+
+  patch-integration:
+    # Prove the shipped patch still applies to the pinned upstream commit and that the
+    # five generated modules are byte-identical to the source tree in impl/.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: contribution
+      - name: Clone pinned upstream
+        run: |
+          git clone --no-checkout https://github.com/${UPSTREAM_REPO}.git upstream
+          cd upstream
+          git fetch --depth 1 origin "${UPSTREAM_COMMIT}"
+          git checkout "${UPSTREAM_COMMIT}"
+      - name: Apply the contribution patch
+        working-directory: upstream
+        run: |
+          git config user.name "mesoSPIM Remote Control CI"
+          git config user.email "remote-control-ci@users.noreply.github.com"
+          git am --3way "${GITHUB_WORKSPACE}/contribution/pull_request/"0001-*.patch
+      - name: Byte-identity of the five generated modules vs impl/ source
+        run: |
+          set -e
+          for m in Config Dispatcher Commands Servers GUI; do
+            f="mesoSPIM/src/mesoSPIM_RemoteControl_${m}.py"
+            diff -u "contribution/impl/${f}" "upstream/${f}"
+          done
+          echo "All five Remote Control modules are byte-identical to impl/ source."

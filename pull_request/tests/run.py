@@ -12,31 +12,35 @@ TESTS = Path(__file__).resolve().parent
 ROOT = TESTS.parent
 
 
+def _source_line():
+    """Name the code actually under test, so `run.py offline` shows patch-vs-source at a glance."""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from tests.support import patch_loader
+    return f"remote-control modules under test: {patch_loader.SOURCE}"
+
+
 def _profile(scope, kind, transport):
     if scope == "offline":
         if transport is not None:
             raise ValueError("offline tests already exercise both MCP and TCP")
-        paths = {
-            "valid": [
-                TESTS / "unit" / "test_validation.py",
-                TESTS / "integration" / "test_valid_transports.py",
-                TESTS / "integration" / "test_viability.py",
-            ],
-            "adversarial": [
-                TESTS / "unit" / "test_adversarial.py",
-                TESTS / "integration" / "test_transport_security.py",
-            ],
-            "all": [TESTS / "unit", TESTS / "integration"],
-        }[kind]
+        print(_source_line(), flush=True)
+        paths = [
+            TESTS / "test_patch_smoke.py",
+            TESTS / "integration" / "test_transport_matrix.py",
+            TESTS / "integration" / "test_busy_gate.py",
+            TESTS / "integration" / "test_transport_security.py",
+        ]
         return paths, {}
 
     if kind == "all":
         raise ValueError("run live valid and live adversarial separately")
     if transport is None:
-        raise ValueError("live tests require mcp, tcp, or both")
+        raise ValueError("live tests require mcp or tcp (a session hosts one transport)")
+    if transport == "both":
+        raise ValueError("a live session hosts one transport; run mcp, then tcp")
+
     if kind == "valid":
-        if transport == "both":
-            raise ValueError("run live valid once per active server: mcp, then tcp")
         test_name = {
             "mcp": "test_live_mcp_x_move_changes_position_and_restores_it",
             "tcp": "test_live_tcp_x_move_changes_position_and_restores_it",
@@ -67,26 +71,19 @@ def main(argv=None):
     environment.update(additions)
     selector = {
         ("offline", "all"): "offline",
-        ("offline", "valid"): "offline and valid",
-        ("offline", "adversarial"): "offline and adversarial",
+        ("offline", "valid"): "offline",
+        ("offline", "adversarial"): "offline",
         ("live", "valid"): "live and valid",
         ("live", "adversarial"): "live and adversarial",
     }[(args.scope, args.kind)]
     command = [
-        sys.executable,
-        "-m",
-        "pytest",
-        *map(str, paths),
-        "--strict-markers",
-        "-m",
-        selector,
-        "-q",
+        sys.executable, "-m", "pytest", *map(str, paths),
+        "--strict-markers", "-m", selector, "-q",
     ]
     if args.scope == "live":
         command.append("-s")
     print(
-        f"Running: {args.scope} {args.kind}"
-        + (f" {args.transport}" if args.transport else ""),
+        f"Running: {args.scope} {args.kind}" + (f" {args.transport}" if args.transport else ""),
         flush=True,
     )
     return subprocess.call(command, cwd=ROOT, env=environment)

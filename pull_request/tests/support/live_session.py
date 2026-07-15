@@ -10,6 +10,21 @@ from pathlib import Path
 import pytest
 
 from tests.support.clients import mcp_call
+from tests.support.patch_loader import config
+
+
+def network_timeout():
+    """Return a client timeout long enough to receive the server's own timeout response."""
+    default = config.DISPATCH_TIMEOUT_SEC + 5.0
+    request_timeout = float(os.environ.get("MESOSPIM_NETWORK_TIMEOUT_SECONDS", str(default)))
+    if not 0.1 <= request_timeout <= 300:
+        raise ValueError("MESOSPIM_NETWORK_TIMEOUT_SECONDS must be between 0.1 and 300")
+    if request_timeout <= config.DISPATCH_TIMEOUT_SEC:
+        raise ValueError(
+            "MESOSPIM_NETWORK_TIMEOUT_SECONDS must exceed the server dispatch timeout "
+            f"({config.DISPATCH_TIMEOUT_SEC:g} seconds)"
+        )
+    return request_timeout
 
 
 def live_config(run_gate="MESOSPIM_RUN_ALL_COMMANDS"):
@@ -36,9 +51,7 @@ def live_config(run_gate="MESOSPIM_RUN_ALL_COMMANDS"):
     hold = float(os.environ.get("MESOSPIM_DEMO_COMMAND_HOLD_SECONDS", "0.25"))
     if not 0 <= hold <= 1:
         raise ValueError("MESOSPIM_DEMO_COMMAND_HOLD_SECONDS must be between 0 and 1")
-    request_timeout = float(os.environ.get("MESOSPIM_NETWORK_TIMEOUT_SECONDS", "10"))
-    if not 0.1 <= request_timeout <= 60:
-        raise ValueError("MESOSPIM_NETWORK_TIMEOUT_SECONDS must be between 0.1 and 60")
+    request_timeout = network_timeout()
 
     demo_root_text = os.environ.get("MESOSPIM_DEMO_ROOT")
     etl_path_text = os.environ.get("MESOSPIM_DEMO_ETL_CONFIG_PATH")
@@ -97,12 +110,17 @@ def must(tool, name, arguments=None):
 
 
 def wait_until(predicate, label):
-    """Poll observable state without guessing an operation duration."""
-    while True:
+    """Poll observable state without guessing duration, but never hang a release-gate run."""
+    timeout = float(os.environ.get("MESOSPIM_OPERATION_TIMEOUT_SECONDS", "120"))
+    if not 1 <= timeout <= 1800:
+        raise ValueError("MESOSPIM_OPERATION_TIMEOUT_SECONDS must be between 1 and 1800")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         result = predicate()
         if result:
             return result
         time.sleep(0.05)
+    raise AssertionError(f"timed out after {timeout:g}s waiting for {label}")
 
 
 def wait_for_operation(tool, result, label):

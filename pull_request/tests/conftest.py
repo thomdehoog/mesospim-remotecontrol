@@ -1,6 +1,5 @@
-"""Pytest grouping for the organized mesoSPIM Remote Control tests."""
+"""Pytest grouping for the mesoSPIM Remote Control tests (five-module architecture)."""
 from pathlib import Path
-
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "unit: Qt-free unit test")
@@ -33,6 +32,8 @@ def pytest_collection_modifyitems(items):
         path = Path(str(item.fspath))
         level = path.parent.name
         module_name = path.name
+        if level == "tests":
+            continue                                    # a root-level file carries its own markers
         if level == "live":
             markers = ["live"]
             if module_name == "test_adversarial.py":

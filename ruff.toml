@@ -1,0 +1,20 @@
+# Small, deliberate Ruff configuration for the Remote Control contribution.
+#
+# The goal is to catch real defects (undefined names, unused imports, syntax
+# errors) without imposing a style rewrite on the five modules, whose import
+# blocks are ordered by architecture (Config -> Dispatcher -> Commands -> Servers)
+# rather than alphabetically. Intentional exceptions carry an inline `# noqa`.
+line-length = 110
+target-version = "py38"
+
+[lint]
+# F  = pyflakes (undefined names, unused imports/variables) -- real bugs
+# E9 = syntax errors
+# E711/E712/E714 = comparison-to-None/bool/not-is mistakes
+select = ["F", "E9"]
+extend-select = ["E711", "E712", "E714"]
+
+[lint.per-file-ignores]
+# Tests use fakes and long assert lines; the source modules are the review target.
+"impl/tests/**" = ["F811"]
+"pull_request/tests/**" = ["F811"]

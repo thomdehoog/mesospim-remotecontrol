@@ -1,8 +1,13 @@
-"""Opt-in bounded adversarial tests for the real mesoSPIM DemoStage."""
+"""Opt-in bounded adversarial tests for the real mesoSPIM DemoStage, over the SINGLE bound
+transport (MESOSPIM_LIVE_ADVERSARIAL_TRANSPORT in {mcp, tcp}; a live session hosts one transport).
+
+This is the only place the real Acceptor cross-thread marshalling under concurrency is exercised:
+the concurrent burst runs entirely on the bound transport (multiple concurrent clients of that one
+transport). The cross-transport busy race is impossible live and is proven offline instead.
+"""
 from __future__ import annotations
 
 import os
-import json
 import shutil
 import socket
 import tempfile
@@ -24,6 +29,7 @@ from tests.support.live_session import must as _must
 from tests.support.live_session import raw_mcp_tool as _raw_tool
 from tests.support.live_session import raw_tcp_tool as _raw_tcp_tool
 from tests.support.live_session import wait_for_operation as _wait_for_operation
+from tests.support.live_session import wait_until as _wait_until
 
 
 pytestmark = pytest.mark.live_adversarial
@@ -34,27 +40,26 @@ MAX_WORKERS = 8
 REJECTED_REQUEST_TIMEOUT = 2.0
 
 
-def _selected_lanes():
-    transport = os.environ.get("MESOSPIM_LIVE_ADVERSARIAL_TRANSPORT", "both").lower()
-    try:
-        return {"mcp": ("mcp",), "tcp": ("tcp",), "both": ("mcp", "tcp")}[transport]
-    except KeyError as exc:
-        raise ValueError(
-            "MESOSPIM_LIVE_ADVERSARIAL_TRANSPORT must be 'mcp', 'tcp', or 'both'") from exc
+def _selected_transport():
+    transport = os.environ.get("MESOSPIM_LIVE_ADVERSARIAL_TRANSPORT", "mcp").lower()
+    if transport not in {"mcp", "tcp"}:
+        raise ValueError("MESOSPIM_LIVE_ADVERSARIAL_TRANSPORT must be 'mcp' or 'tcp'")
+    return transport
+
+
+def _busy_message(reply):
+    return str(reply.get("error", reply)) if isinstance(reply, dict) else str(reply)
 
 
 def _rejected_tcp_raw(host, port, token, payload):
-    """Send a deliberately malformed payload and assert the server refuses it.
-
-    This one speaks the raw wire rather than going through RemoteControl, because the whole
-    point is to send something RemoteControl.call() could never produce.
-    """
+    """Send a deliberately malformed payload and assert the server refuses it."""
     sock = socket.create_connection((host, int(port)), timeout=REJECTED_REQUEST_TIMEOUT)
     try:
         sock.sendall(srv.frame(token))
-        assert srv.read_frame(sock).strip() == "OK"
+        reader = srv.FrameReader(sock)
+        assert reader.read().strip() == "OK"
         sock.sendall(srv.frame(payload))
-        assert "__MESOSPIM_OK__" not in srv.read_frame(sock)
+        assert "__MESOSPIM_OK__" not in reader.read()
     finally:
         sock.close()
 
@@ -64,47 +69,63 @@ def _rejected_mcp_raw(host, port, token, body):
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(
-        f"http://{host}:{port}/mcp", data=body.encode("utf-8"), headers=headers,
-        method="POST")
+        f"http://{host}:{port}/mcp", data=body.encode("utf-8"), headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(
-                request, timeout=REJECTED_REQUEST_TIMEOUT) as response:
+        with urllib.request.urlopen(request, timeout=REJECTED_REQUEST_TIMEOUT) as response:
             status = response.status
     except urllib.error.HTTPError as exc:
         status = exc.code
     assert status == 400
 
 
-def test_real_demo_rejects_hostile_api_corpus_and_recovers():
-    """Try to break selected live APIs, proving refusals leave DemoStage unchanged."""
-    host, port, token, _hold, request_timeout, _root, _etl, _pid = _live_config(
-        "MESOSPIM_RUN_LIVE_ADVERSARIAL")
-    lanes = _selected_lanes()
-    if "mcp" in lanes and not token:
-        pytest.skip("set MESOSPIM_LIVE_MCP_TOKEN for the live MCP server")
+def _make_tool(transport, host, port, token, request_timeout):
+    if transport == "mcp":
+        if not token:
+            pytest.skip("set MESOSPIM_LIVE_MCP_TOKEN for the live MCP server")
+        return lambda name, arguments=None: _raw_tool(
+            host, port, token, request_timeout, name, arguments), None
     tcp_host = os.environ.get("MESOSPIM_LIVE_TCP_HOST", "127.0.0.1")
     tcp_port = os.environ.get("MESOSPIM_LIVE_TCP_PORT")
     tcp_token = os.environ.get("MESOSPIM_LIVE_TCP_TOKEN")
-    if "tcp" in lanes and (
-            tcp_host not in {"127.0.0.1", "localhost"} or not tcp_port or not tcp_token):
+    if tcp_host not in {"127.0.0.1", "localhost"} or not tcp_port or not tcp_token:
         pytest.skip("set loopback MESOSPIM_LIVE_TCP_PORT and MESOSPIM_LIVE_TCP_TOKEN")
 
-    mcp_tool = lambda name, arguments=None: _raw_tool(
-        host, port, token, request_timeout, name, arguments)
-
-    def tcp_call(name, arguments):
-        client = RemoteControl(
-            tcp_host, int(tcp_port), tcp_token, timeout=REJECTED_REQUEST_TIMEOUT)
+    def tool(name, arguments=None):
+        # Normal authenticated calls use the configured live-operation timeout. The two-second
+        # hostile-input bound belongs only to deliberately rejected raw frames above; applying it
+        # here made a fresh TCP authentication race a finishing acquisition and masked cleanup.
+        client = RemoteControl(tcp_host, int(tcp_port), tcp_token, timeout=request_timeout)
         try:
             return _raw_tcp_tool(client, name, arguments)
         finally:
             client.close()
 
-    def lane_call(lane, name, arguments=None):
-        return mcp_tool(name, arguments) if lane == "mcp" else tcp_call(
-            name, arguments or {})
+    return tool, (tcp_host, tcp_port, tcp_token)
 
-    tool = lambda name, arguments=None: lane_call(lanes[0], name, arguments)
+
+def _wait_for_failed_operation(tool, started, label):
+    operation_id = started["operation"]["id"]
+
+    def terminal():
+        operation = _must(tool, "get_progress")["operation"]
+        if operation.get("id") != operation_id:
+            raise AssertionError(
+                f"{label} operation changed from {operation_id} to {operation.get('id')}")
+        return operation if operation.get("status") in {"completed", "failed"} else None
+
+    operation = _wait_until(terminal, f"{label} terminal operation")
+    assert operation["status"] == "failed", operation
+    assert "preflight" in operation.get("error", "").lower(), operation
+    return operation
+
+
+def test_real_demo_rejects_hostile_api_corpus_and_recovers():
+    """Try to break the bound live API, proving refusals leave DemoStage unchanged."""
+    host, port, token, _hold, request_timeout, _root, _etl, _pid = _live_config(
+        "MESOSPIM_RUN_LIVE_ADVERSARIAL")
+    transport = _selected_transport()
+    tool, tcp = _make_tool(transport, host, port, token, request_timeout)
+
     limits = _must(tool, "get_limits")
     if (limits.get("stage") or {}).get("stage_type") != "DemoStage":
         pytest.fail("refusing live adversarial attacks outside DemoStage")
@@ -116,18 +137,42 @@ def test_real_demo_rejects_hostile_api_corpus_and_recovers():
     original = _must(tool, "get_state_all", {"keys": state_keys})
     assert original["state"] == "idle"
 
-    attacks = [
-        (name, {}) for name in ("__class__", "__globals__", "eval", "os.system")
-    ]
+    attacks = [(name, {}) for name in ("__class__", "__globals__", "eval", "os.system")]
+    command_names = _must(tool, "get_capabilities")["commands"]
+    # The valid live sweep supplies a reviewed good payload for every command. Pair it here with a
+    # universal bad payload: every exact command must reject an extra/misspelled field as validation
+    # before any handler or hardware call runs.
+    attacks.extend((name, {"__unexpected__": True}) for name in command_names)
     position = original["position"]
     for axis, bounds in limits["enforced"]["axes"].items():
         if bounds:
             attacks.append(("move_absolute", {"targets": {axis: bounds[1] + 1}}))
             attacks.append(("move_absolute", {"targets": {axis: bounds[0] - 1}}))
-            attacks.append(("move_relative", {
-                "deltas": {axis: bounds[1] - position[axis + "_pos"] + 1}}))
-            attacks.append(("move_relative", {
-                "deltas": {axis: bounds[0] - position[axis + "_pos"] - 1}}))
+            attacks.append(("move_relative", {"deltas": {axis: bounds[1] - position[axis + "_pos"] + 1}}))
+            attacks.append(("move_relative", {"deltas": {axis: bounds[0] - position[axis + "_pos"] - 1}}))
+    # Every BOUNDED hardware parameter (voltages, frequency, phase, camera/scan timings, percents)
+    # must refuse a value one step past its enforced range, exercising every reported parameter
+    # bounds on real hardware, derived from what get_limits actually reports (not hardcoded). Both the
+    # grouped path (set_state) and the dedicated setter are hit.
+    _setter_for = {"camera_exposure_time": "set_camera", "sweeptime": "set_state"}
+    for key, spec in limits["enforced"]["parameters"].items():
+        rng = spec.get("range")
+        if not rng or spec.get("type") != "number":
+            continue
+        setter = _setter_for.get(key,
+                                 "set_etl" if key.startswith("etl_") else
+                                 "set_galvo" if key.startswith("galvo_") else
+                                 "set_laser_timing" if key.startswith("laser_") else
+                                 "set_intensity" if key == "intensity" else "set_state")
+        for bad in (rng[1] + 1, rng[0] - 1):
+            payload = {"intensity": bad} if key == "intensity" else {key: bad}
+            attacks.append((setter, payload if setter != "set_state" else {"settings": {key: bad}}))
+            if setter != "set_state":
+                attacks.append(("set_state", {"settings": {key: bad}}))      # same generic-setter bound
+
+    # The guarded recovery command must be a safe no-op while the microscope is idle (it may only free
+    # the gate when the core is INDEPENDENTLY idle, and there is no wedged op here). It is NOT hostile,
+    # so it is verified separately below rather than in the "must be rejected" corpus.
     x_too_high = limits["enforced"]["axes"]["x"][1] + 1
     attacks.extend([
         ("move_absolute", {"targets": {"not_an_axis": 1}}),
@@ -143,10 +188,8 @@ def test_real_demo_rejects_hostile_api_corpus_and_recovers():
         ("set_galvo", {"galvo_l_duty_cycle": 101}),
         ("set_laser_timing", {"laser_l_delay_%": -1}),
         ("set_acquisition_list", {"acquisitions": "not-a-list"}),
-        ("set_acquisition_list", {
-            "acquisitions": [{"intensity": 101}], "selected_row": 0}),
-        ("set_acquisition_list", {
-            "acquisitions": [{"x_pos": x_too_high}], "selected_row": 0}),
+        ("set_acquisition_list", {"acquisitions": [{"intensity": 101}], "selected_row": 0}),
+        ("set_acquisition_list", {"acquisitions": [{"x_pos": x_too_high}], "selected_row": 0}),
         ("set_acquisition_list", {"acquisitions": [{}], "selected_row": -1}),
         ("acquire_start", {"acquisition": []}),
         ("acquire_start", {"acquisition": {"intensity": 101}}),
@@ -155,33 +198,31 @@ def test_real_demo_rejects_hostile_api_corpus_and_recovers():
         ("preview_acquisition", {"row": -1}),
         ("time_lapse_start", {"timepoints": 0, "interval_sec": 0}),
         ("time_lapse_start", {"timepoints": 1, "interval_sec": -1}),
-        ("set_mode", {"mode": "__invalid_mode__"}),
-        ("snap", {"write": True}),
-        ("set_state", {"settings": {"state": "snap"}}),
-        ("get_snap_image", {"offset": -1}),
-        ("get_snap_image", {"max_bytes": 512 * 1024 + 1}),
+        ("set_state", {"settings": {"state": "live"}}),   # 'state' is not a settable key
     ])
-    assert len(attacks) <= 52
+    assert len(attacks) <= 256
 
     try:
-        for lane in lanes:
-            for name, arguments in attacks:
-                ok, reply = lane_call(lane, name, arguments)
-                assert not ok, f"{lane} accepted hostile {name}: {arguments!r} -> {reply!r}"
+        for name, arguments in attacks:
+            ok, reply = tool(name, arguments)
+            assert not ok, f"{transport} accepted hostile {name}: {arguments!r} -> {reply!r}"
+            if arguments == {"__unexpected__": True}:
+                assert "validation" in str(reply).lower(), (name, reply)
 
         raw_count = 0
-        if "tcp" in lanes:
+        if transport == "tcp":
+            _, tcp_port, tcp_token = tcp
             for payload in (
                 '{"ping":{},"get_state":{}}',
                 '{"set_intensity":{"intensity":1},"set_intensity":{"intensity":2}}',
                 '{"set_intensity":{"intensity":NaN}}',
-                '[]',
+                "[]",
             ):
-                _rejected_tcp_raw(tcp_host, tcp_port, tcp_token, payload)
+                _rejected_tcp_raw("127.0.0.1", tcp_port, tcp_token, payload)
                 raw_count += 1
-        if "mcp" in lanes:
+        else:
             for body in (
-                '{',
+                "{",
                 '{"jsonrpc":"2.0","id":1,"method":"tools/list","method":"tools/call"}',
                 '{"jsonrpc":"2.0","id":NaN,"method":"tools/list"}',
             ):
@@ -190,22 +231,23 @@ def test_real_demo_rejects_hostile_api_corpus_and_recovers():
 
         after = _must(tool, "get_state_all", {"keys": state_keys})
         assert after == original
-        for lane in lanes:
-            ok, hello = lane_call(lane, "hello", {})
-            assert ok and hello["app"] == "mesoSPIM-control"
-        print(
-            "LIVE HOSTILE API CORPUS VERIFIED: "
-            f"{len(attacks) * len(lanes) + raw_count} rejected attacks; "
-            f"state unchanged; {','.join(lanes)} healthy",
-            flush=True,
-        )
+
+        # Guarded recovery is a safe no-op while idle; it must not free a gate that
+        # nothing holds, and it must not touch hardware.
+        recovered = _must(tool, "clear_stuck_operation")
+        assert recovered["cleared"] is False, recovered
+        assert _must(tool, "get_state_all", {"keys": state_keys}) == original
+
+        ok, hello = tool("hello", {})
+        assert ok and hello["app"] == "mesoSPIM-control"
+        print(f"LIVE HOSTILE API CORPUS VERIFIED: {len(attacks) + raw_count} rejected attacks; "
+              f"hardware-parameter bounds enforced; guarded recovery idle-safe; "
+              f"state unchanged; {transport} healthy", flush=True)
     finally:
         for name, arguments in (
-            ("set_mode", {"mode": "idle"}),
+            ("stop_activity", {}),
             ("move_absolute", {"targets": {
-                axis: original["position"][axis + "_pos"]
-                for axis in ("x", "y", "z", "f", "theta")
-            }}),
+                axis: original["position"][axis + "_pos"] for axis in ("x", "y", "z", "f", "theta")}}),
             ("set_filter", {"filter": original["filter"], "wait": True}),
             ("set_zoom", {"zoom": original["zoom"], "wait": True, "update_etl": False}),
             ("set_laser", {"laser": original["laser"], "wait": True, "update_etl": False}),
@@ -219,48 +261,41 @@ def test_real_demo_rejects_hostile_api_corpus_and_recovers():
                 pass
 
 
-def test_real_demo_busy_gate_survives_bounded_mcp_tcp_concurrency():
-    """One real operation must atomically reject a mixed 24-call concurrent burst."""
+def test_real_demo_busy_gate_survives_bounded_single_transport_concurrency():
+    """One real operation must atomically reject a mixed 24-call concurrent burst on the bound lane."""
     host, port, token, _hold, request_timeout, _root, _etl, process_id = _live_config(
         "MESOSPIM_RUN_LIVE_ADVERSARIAL")
-    lanes = _selected_lanes()
-    if "mcp" in lanes and not token:
-        pytest.skip("set MESOSPIM_LIVE_MCP_TOKEN for the live MCP server")
+    transport = _selected_transport()
 
-    tcp_host = os.environ.get("MESOSPIM_LIVE_TCP_HOST", "127.0.0.1")
-    tcp_port = os.environ.get("MESOSPIM_LIVE_TCP_PORT")
-    tcp_token = os.environ.get("MESOSPIM_LIVE_TCP_TOKEN")
-    if "tcp" in lanes and (
-            tcp_host not in {"127.0.0.1", "localhost"} or not tcp_port or not tcp_token):
-        pytest.skip("set loopback MESOSPIM_LIVE_TCP_PORT and MESOSPIM_LIVE_TCP_TOKEN")
+    # The burst needs many concurrent clients of the ONE bound transport, so build a per-call tool.
+    if transport == "mcp":
+        if not token:
+            pytest.skip("set MESOSPIM_LIVE_MCP_TOKEN for the live MCP server")
+        burst_call = lambda name, arguments=None: _raw_tool(
+            host, port, token, request_timeout, name, arguments)
+    else:
+        tcp_host = os.environ.get("MESOSPIM_LIVE_TCP_HOST", "127.0.0.1")
+        tcp_port = os.environ.get("MESOSPIM_LIVE_TCP_PORT")
+        tcp_token = os.environ.get("MESOSPIM_LIVE_TCP_TOKEN")
+        if tcp_host not in {"127.0.0.1", "localhost"} or not tcp_port or not tcp_token:
+            pytest.skip("set loopback MESOSPIM_LIVE_TCP_PORT and MESOSPIM_LIVE_TCP_TOKEN")
 
-    mcp_tool = lambda name, arguments=None: _raw_tool(
-        host, port, token, request_timeout, name, arguments)
+        def burst_call(name, arguments=None):
+            client = RemoteControl(tcp_host, int(tcp_port), tcp_token, timeout=request_timeout)
+            try:
+                return _raw_tcp_tool(client, name, arguments)
+            finally:
+                client.close()
 
-    def tcp_call(name, arguments):
-        client = RemoteControl(
-            tcp_host, int(tcp_port), tcp_token, timeout=request_timeout)
-        try:
-            return _raw_tcp_tool(client, name, arguments)
-        finally:
-            client.close()
-
-    def lane_call(lane, name, arguments=None):
-        return mcp_tool(name, arguments) if lane == "mcp" else tcp_call(
-            name, arguments or {})
-
-    tool = lambda name, arguments=None: lane_call(lanes[0], name, arguments)
+    tool = burst_call
     limits = _must(tool, "get_limits")
     if (limits.get("stage") or {}).get("stage_type") != "DemoStage":
         pytest.fail("refusing live adversarial stress outside DemoStage")
 
-    lane_key = "-".join(lanes)
     sentinel = Path(tempfile.gettempdir()) / (
-        f".mesospim_demo_busy_stress_{process_id}_{lane_key}.done"
-    )
+        f".mesospim_demo_busy_stress_{process_id}_{transport}.done")
     if sentinel.exists():
-        pytest.skip(
-            f"live busy stress already ran for PID {process_id}, lanes={lane_key}")
+        pytest.skip(f"live busy stress already ran for PID {process_id}, transport={transport}")
     sentinel.write_text("bounded live busy stress started\n", encoding="utf-8")
 
     state_keys = [
@@ -274,76 +309,63 @@ def test_real_demo_busy_gate_survives_bounded_mcp_tcp_concurrency():
     acquisition = _demo_acquisition(temp_folder, "busy-stress.raw", original)
     z_start = float(acquisition["z_start"])
     z_limit = limits["enforced"]["axes"]["z"]
-    if not z_limit or z_start + 4 > z_limit[1]:
+    if not z_limit:
+        pytest.fail("demo Z axis has no enforced range")
+    z_end = z_start + 4 if z_start + 4 <= z_limit[1] else z_start - 4
+    if z_end < z_limit[0]:
         pytest.fail("demo Z range is too small for the five-plane busy stress acquisition")
-    acquisition.update({"z_end": z_start + 4, "planes": 5})
+    acquisition.update({"z_end": z_end, "planes": 5})
     accepted = None
 
     try:
-        _must(tool, "set_acquisition_list", {
-            "acquisitions": [acquisition], "selected_row": 0})
+        _must(tool, "set_acquisition_list", {"acquisitions": [acquisition], "selected_row": 0})
         accepted = _must(tool, "run_acquisition_list")
         operation = accepted["operation"]
         assert operation["status"] == "processing"
 
         attempts = []
         for index in range(MUTATION_ATTEMPTS):
-            attempts.append(("mutation", lanes[index % len(lanes)]))
+            attempts.append("mutation")
             if index < READ_ATTEMPTS:
-                attempts.append(("read", lanes[(index + 1) % len(lanes)]))
+                attempts.append("read")
         release = threading.Event()
 
-        def attempt(item):
+        def attempt(kind):
             release.wait()
             started = time.perf_counter()
-            kind, lane = item
             name = "set_intensity" if kind == "mutation" else "get_progress"
-            arguments = {"intensity": alternate_intensity, "wait": True} if (
-                kind == "mutation") else {}
-            ok, reply = lane_call(lane, name, arguments)
-            return kind, lane, ok, reply, time.perf_counter() - started
+            arguments = {"intensity": alternate_intensity, "wait": True} if kind == "mutation" else {}
+            ok, reply = burst_call(name, arguments)
+            return kind, ok, reply, time.perf_counter() - started
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = [executor.submit(attempt, item) for item in attempts]
-            burst_started = time.perf_counter()
             release.set()
             results = [future.result() for future in futures]
-            burst_elapsed = time.perf_counter() - burst_started
 
-        for kind, _lane, ok, reply, _latency in results:
+        for kind, ok, reply, _latency in results:
             if kind == "mutation":
                 assert not ok, reply
-                error = str(reply.get("error", reply))
-                assert "system busy" in error
-                assert operation["id"] in error
-                assert operation["command"] in error
+                error = _busy_message(reply)
+                assert "busy" in error                       # new wire text: 'busy: <cmd> (<id>) ...'
+                assert operation["command"] in error         # names the running command
+                assert operation["id"] in error              # names the running op id
             else:
                 assert ok, reply
                 assert reply["operation"]["id"] == operation["id"]
                 assert reply["operation"]["status"] == "processing"
 
-        latencies = sorted(result[4] for result in results)
-        p95 = latencies[max(0, int(len(latencies) * 0.95) - 1)]
-        print(
-            "LIVE BUSY STRESS VERIFIED: "
-            f"{MUTATION_ATTEMPTS} mutations rejected, {READ_ATTEMPTS} reads served, "
-            f"lanes={','.join(lanes)}, burst={burst_elapsed:.3f}s, "
-            f"p95={p95:.3f}s, max={latencies[-1]:.3f}s",
-            flush=True,
-        )
-
         unchanged = _must(tool, "get_state_all", {"keys": ["intensity"]})
         assert unchanged["intensity"] == original["intensity"]
         _wait_for_operation(tool, accepted, "busy stress acquisition")
 
-        for lane in lanes:
-            ok, reopened = lane_call(lane, "set_intensity", {
-                "intensity": alternate_intensity, "wait": True})
-            assert ok, reopened
-            assert reopened["operation"]["status"] == "completed"
-        restored = _must(tool, "set_intensity", {
-            "intensity": original["intensity"], "wait": True})
+        ok, reopened = burst_call("set_intensity", {"intensity": alternate_intensity, "wait": True})
+        assert ok, reopened
+        assert reopened["operation"]["status"] == "completed"
+        restored = _must(tool, "set_intensity", {"intensity": original["intensity"], "wait": True})
         assert restored["operation"]["status"] == "completed"
+        print(f"LIVE BUSY STRESS VERIFIED: {MUTATION_ATTEMPTS} mutations rejected, "
+              f"{READ_ATTEMPTS} reads served, transport={transport}", flush=True)
     finally:
         if accepted is not None:
             try:
@@ -353,11 +375,8 @@ def test_real_demo_busy_gate_survives_bounded_mcp_tcp_concurrency():
         for name, arguments in (
             ("set_intensity", {"intensity": original["intensity"], "wait": True}),
             ("move_absolute", {"targets": {
-                axis: original["position"][axis + "_pos"]
-                for axis in ("x", "y", "z", "f", "theta")
-            }}),
-            ("set_acquisition_list", {
-                "acquisitions": original_acquisitions, "selected_row": 0}),
+                axis: original["position"][axis + "_pos"] for axis in ("x", "y", "z", "f", "theta")}}),
+            ("set_acquisition_list", {"acquisitions": original_acquisitions, "selected_row": 0}),
         ):
             try:
                 cleanup = _must(tool, name, arguments)
@@ -369,3 +388,235 @@ def test_real_demo_busy_gate_survives_bounded_mcp_tcp_concurrency():
     final = _must(tool, "get_state_all", {"keys": ["intensity", "position"]})
     assert final["intensity"] == original["intensity"]
     assert final["position"] == original["position"]
+
+
+def test_real_demo_acquisition_completes_and_recovery_is_guarded():
+    """A remote acquisition must complete without wedging, and guarded recovery must refuse to
+    clear genuinely running work. ``acquire_start`` restores the operator's list through
+    ``acquire_finish``. This is the live validation of the operation-completion model."""
+    host, port, token, _hold, request_timeout, root, _etl, process_id = _live_config(
+        "MESOSPIM_RUN_LIVE_ADVERSARIAL")
+    transport = _selected_transport()
+    tool, _tcp = _make_tool(transport, host, port, token, request_timeout)
+
+    limits = _must(tool, "get_limits")
+    if (limits.get("stage") or {}).get("stage_type") != "DemoStage":
+        pytest.fail("refusing live acquisition test outside DemoStage")
+
+    keys = ["state", "position", "laser", "intensity", "filter", "zoom", "shutterconfig",
+            "etl_l_offset", "etl_l_amplitude", "etl_r_offset", "etl_r_amplitude"]
+    state = _must(tool, "get_state_all", {"keys": keys})
+    assert state["state"] == "idle"
+    folder = Path(tempfile.mkdtemp(prefix=f"mesospim_acquire_{process_id}_", dir=root))
+    acquisition = _demo_acquisition(folder, "refactor_probe.raw", state)
+    started = None
+
+    try:
+        started = _must(tool, "acquire_start", {"acquisition": acquisition})
+        assert started["operation"]["status"] in ("processing", "completed")
+
+        # If we catch it running, Core must report a run state because the remote command is no
+        # longer idle mid-acquisition. Guarded recovery must refuse to clear genuinely active work.
+        # This observation is best-effort because a one-plane demo may finish before the first poll;
+        # the hard guarantee is that the operation reaches a terminal state.
+        if _must(tool, "get_progress")["operation"].get("status") == "processing":
+            assert _must(tool, "get_state")["state"] in (
+                "run_acquisition_list", "run_selected_acquisition")
+            assert _must(tool, "clear_stuck_operation")["cleared"] is False   # never abort a live run
+
+        _wait_for_operation(tool, started, "remote acquire_start")   # HARD: it completes, never wedges
+    finally:
+        # A polling/client failure must not make acquire_finish race the still-running WAIT and then
+        # mask the original error with BusyError. Wait for terminal state before restoring the list.
+        if started is not None:
+            _wait_for_operation(tool, started, "remote acquire_start cleanup")
+        _must(tool, "acquire_finish")                                # restore the operator's list
+        shutil.rmtree(folder, ignore_errors=True)
+
+    assert not folder.exists()
+    assert _must(tool, "get_state")["state"] == "idle"
+    assert _must(tool, "clear_stuck_operation")["cleared"] is False   # a safe no-op once idle
+    print(f"LIVE ACQUISITION LIFECYCLE VERIFIED: acquire_start completed on {transport}; "
+          f"run-state reported; recovery guarded; operator list restored", flush=True)
+
+
+def test_real_demo_preflight_refusals_are_failed_terminal_and_recoverable():
+    """Exercise upstream's early sig_finished refusal branches without allowing a gate wedge."""
+    host, port, token, _hold, request_timeout, root, _etl, process_id = _live_config(
+        "MESOSPIM_RUN_LIVE_ADVERSARIAL")
+    transport = _selected_transport()
+    tool, _tcp = _make_tool(transport, host, port, token, request_timeout)
+    limits = _must(tool, "get_limits")
+    if (limits.get("stage") or {}).get("stage_type") != "DemoStage":
+        pytest.fail("refusing live preflight tests outside DemoStage")
+
+    keys = ["state", "position", "laser", "intensity", "filter", "zoom", "shutterconfig",
+            "etl_l_offset", "etl_l_amplitude", "etl_r_offset", "etl_r_amplitude"]
+    original_state = _must(tool, "get_state_all", {"keys": keys})
+    original_list = _must(tool, "get_acquisition_list")["acquisitions"]
+    folder = Path(tempfile.mkdtemp(prefix=f"mesospim_preflight_{process_id}_", dir=root))
+    existing = folder / "already-exists.raw"
+    existing.write_bytes(b"do not overwrite")
+    cases = []
+    for case, target_folder, filename in (
+        ("missing folder", folder / "missing", "missing.raw"),
+        ("existing file", folder, existing.name),
+        ("missing extension", folder, "no-extension"),
+    ):
+        acquisition = _demo_acquisition(target_folder, filename, original_state)
+        cases.append((case, acquisition))
+    verified = 0
+
+    try:
+        for case, acquisition in cases:
+            started = _must(tool, "acquire_start", {"acquisition": acquisition})
+            assert started["operation"]["status"] in {"processing", "failed"}
+            _wait_for_failed_operation(tool, started, case)
+            assert _must(tool, "get_state")["state"] == "idle"
+            _must(tool, "acquire_finish")
+            assert _must(tool, "get_acquisition_list")["acquisitions"] == original_list
+            assert _must(tool, "clear_stuck_operation")["cleared"] is False
+            verified += 1
+
+        duplicate = _demo_acquisition(folder, "duplicate.raw", original_state)
+        _must(tool, "set_acquisition_list", {
+            "acquisitions": [duplicate, dict(duplicate)], "selected_row": 0})
+        started = _must(tool, "run_acquisition_list")
+        _wait_for_failed_operation(tool, started, "duplicate filenames")
+        assert _must(tool, "get_state")["state"] == "idle"
+        verified += 1
+
+        # Exercise the disk-space preflight only when the reported free/required values prove that
+        # upstream will refuse it. The million-plane ceiling keeps this bounded and no image is taken.
+        z_low, z_high = limits["enforced"]["axes"]["z"]
+        z_start = float(original_state["position"]["z_pos"])
+        z_end = z_high if z_start != z_high else z_low
+        if z_end != z_start:
+            planes = 1_000_000
+            disk_pressure = _demo_acquisition(folder, "disk-pressure.raw", original_state)
+            disk_pressure.update({
+                "z_end": z_end,
+                "z_step": abs(z_end - z_start) / (planes - 1),
+                "planes": planes,
+            })
+            disk = _must(tool, "get_disk_space", {"acquisitions": [disk_pressure]})
+            if disk["free_bytes"] < disk["required_bytes"] * 1.1:
+                _must(tool, "set_acquisition_list", {
+                    "acquisitions": [disk_pressure], "selected_row": 0})
+                started = _must(tool, "run_acquisition_list")
+                _wait_for_failed_operation(tool, started, "insufficient disk space")
+                assert _must(tool, "get_state")["state"] == "idle"
+                verified += 1
+    finally:
+        try:
+            _must(tool, "acquire_finish")
+        except Exception:
+            pass
+        try:
+            _must(tool, "set_acquisition_list", {
+                "acquisitions": original_list, "selected_row": 0})
+        except Exception:
+            pass
+        shutil.rmtree(folder, ignore_errors=True)
+
+    assert existing.exists() is False                  # temp tree removed; user data was never touched
+    assert _must(tool, "get_state")["state"] == "idle"
+    print(f"LIVE PREFLIGHT RECOVERY VERIFIED: {verified} upstream refusals became failed terminal "
+          f"operations; list restored; transport={transport}", flush=True)
+
+
+def test_real_demo_native_acquisition_list_round_trips_exactly():
+    """Reinstall mesoSPIM's own rows verbatim, including its planes/geometry metadata mismatch."""
+    host, port, token, _hold, request_timeout, _root, _etl, _process_id = _live_config(
+        "MESOSPIM_RUN_LIVE_ADVERSARIAL")
+    transport = _selected_transport()
+    tool, _tcp = _make_tool(transport, host, port, token, request_timeout)
+    limits = _must(tool, "get_limits")
+    if (limits.get("stage") or {}).get("stage_type") != "DemoStage":
+        pytest.fail("refusing live acquisition-list test outside DemoStage")
+    assert _must(tool, "get_state")["state"] == "idle"
+
+    original = _must(tool, "get_acquisition_list")["acquisitions"]
+    if not original:
+        pytest.skip("the live acquisition list is empty; no native row is available to round-trip")
+
+    try:
+        installed = _must(tool, "set_acquisition_list", {"acquisitions": original})
+        assert installed["count"] == len(original)
+        assert _must(tool, "get_acquisition_list")["acquisitions"] == original
+    finally:
+        # Omitting selected_row preserves the operator's current table selection.
+        _must(tool, "set_acquisition_list", {"acquisitions": original})
+
+    print(f"LIVE NATIVE LIST ROUND TRIP VERIFIED: {len(original)} row(s); "
+          f"transport={transport}", flush=True)
+
+
+def test_real_demo_time_lapse_idle_gap_cannot_be_mistaken_for_a_wedge():
+    """After point 0, Core is idle while the time lapse is still active; recovery must refuse."""
+    host, port, token, _hold, request_timeout, root, _etl, process_id = _live_config(
+        "MESOSPIM_RUN_LIVE_ADVERSARIAL")
+    transport = _selected_transport()
+    tool, _tcp = _make_tool(transport, host, port, token, request_timeout)
+    limits = _must(tool, "get_limits")
+    if (limits.get("stage") or {}).get("stage_type") != "DemoStage":
+        pytest.fail("refusing live time-lapse test outside DemoStage")
+
+    keys = ["state", "position", "laser", "intensity", "filter", "zoom", "shutterconfig",
+            "etl_l_offset", "etl_l_amplitude", "etl_r_offset", "etl_r_amplitude"]
+    original_state = _must(tool, "get_state_all", {"keys": keys})
+    original_list = _must(tool, "get_acquisition_list")["acquisitions"]
+    folder = Path(tempfile.mkdtemp(prefix=f"mesospim_timelapse_{process_id}_", dir=root))
+    acquisition = _demo_acquisition(folder, "idle-gap.raw", original_state)
+    started = None
+
+    try:
+        _must(tool, "set_acquisition_list", {"acquisitions": [acquisition], "selected_row": 0})
+        started = _must(tool, "time_lapse_start", {"timepoints": 2, "interval_sec": 10})
+        operation_id = started["operation"]["id"]
+        observation = {}
+
+        def first_point_finished_and_waiting():
+            operation = _must(tool, "get_progress")["operation"]
+            state = _must(tool, "get_state")["state"]
+            outputs = sorted(path.name for path in folder.iterdir())
+            observation.update(state=state, operation=operation, outputs=outputs)
+            first_output_exists = any("_Time000" in name for name in outputs)
+            return first_output_exists and state == "idle" and operation.get("id") == operation_id \
+                and operation.get("status") == "processing"
+
+        try:
+            _wait_until(first_point_finished_and_waiting, "time lapse idle interval after point 0")
+        except AssertionError as exc:
+            raise AssertionError(f"{exc}; last observation={observation!r}") from exc
+        recovery = _must(tool, "clear_stuck_operation")
+        assert recovery["cleared"] is False
+        assert "time lapse is still active" in recovery["reason"]
+        _must(tool, "time_lapse_stop")
+
+        def terminal_operation():
+            operation = _must(tool, "get_progress")["operation"]
+            return operation if operation.get("status") in {"completed", "failed"} else None
+
+        terminal = _wait_until(terminal_operation, "time lapse cancellation")
+        assert terminal["id"] == operation_id and terminal.get("stop_requested") is True
+    finally:
+        try:
+            _must(tool, "time_lapse_stop")
+        except Exception:
+            pass
+        if started is not None:
+            try:
+                _must(tool, "stop_activity")
+            except Exception:
+                pass
+        try:
+            _must(tool, "set_acquisition_list", {
+                "acquisitions": original_list, "selected_row": 0})
+        except Exception:
+            pass
+        shutil.rmtree(folder, ignore_errors=True)
+
+    assert _must(tool, "get_state")["state"] == "idle"
+    print(f"LIVE TIME-LAPSE GAP VERIFIED: recovery refused between points; explicit stop completed; "
+          f"transport={transport}", flush=True)

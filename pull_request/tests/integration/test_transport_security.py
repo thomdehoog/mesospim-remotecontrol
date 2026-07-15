@@ -1,865 +1,451 @@
-"""Bounded transport-security and busy-gate tests for MCP and TCP.
+"""The representative adversarial + boundary transport suite over both lanes, plus the two
+confusable corpora (Origin/Auth), the folded viability check, MCP bind/serve/stop, wire discovery,
+and the KeyError-over-MCP code check.
 
-Every attack in this file enters through a real loopback transport:
+ONE named function per attack class (not one mega-parametrize), so a failure names the class. The
+exhaustive codes/status matrix lives in impl/tests/; here we prove the SHIPPED wire rejects hostile
+input end-to-end. Bounded: REQUEST_TIMEOUT <= 0.6 and every corpus has an explicit size cap.
 
-* MCP attacks are HTTP POSTs handled by the production ``MCPHandler``.
-* TCP attacks are length-framed socket messages decoded by the production
-  ``FrameDecoder`` and ``AuthGate`` before production dispatch.
-
-The MCP server forwards to the TCP test server exactly like the real deployment.
-A recording fake Core proves that rejected inputs never reach instrument methods.
-The corpus is intentionally small and deterministic: no sleeps, no open-ended
-fuzzing, and a 0.6 second socket deadline.
+Three MCP client paths coexist on purpose — do not "unify" them: `_h.invoke`/`mcp_call` is the
+normal tools/call path; `_jsonrpc` (urllib) drives HTTP status codes and raw JSON-RPC bodies; `_raw`
+(raw socket) is the only one that can send a duplicate Content-Length, an oversized length with the
+body withheld, or an arbitrary Origin/Authorization header. Collapsing them loses that reach.
 """
 from __future__ import annotations
 
 import json
-import random
-import socket
-import socketserver
-import threading
-import time
-import types
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-from http.server import ThreadingHTTPServer
 
 import pytest
 
-from tests.support import SOURCE_ROOT
-from tests.support.fake_core import TransportConfig as _Cfg
-from tests.support.fake_state import FakeState
-from tests.support.patch_loader import srv as patch_srv
-from tests.support.patch_loader import vrc as patch_vrc
+from tests.live import test_adversarial as live_adversarial
+from tests.support.harness import Harness, TOKEN, last_frame
+from tests.support.fakes import RecordingCore
+from tests.support.patch_loader import dispatcher, config, srv
+from tests.support.contracts import UNEXPECTED_ARGUMENT_CASES, VALID_CASES
+from tests.support import live_session
 
-
-if SOURCE_ROOT is not None:
-    from mesoSPIM.src import mesoSPIM_RemoteControl_Servers as srv
-    from mesoSPIM.src import mesoSPIM_RemoteControl_ValidateAndRunCommands as vrc
-
-else:
-    srv, vrc = patch_srv, patch_vrc
-
-
-TOKEN = "harsh-MCP+TCP-token-Ac"
 REQUEST_TIMEOUT = 0.6
-MAX_ACCEPTED_BODY = 1 << 20
-MAX_FUZZ_CASES = 48
-BUSY_STRESS_MUTATIONS = 16
-BUSY_STRESS_READS = 8
 
-
-class _RecordingCore:
-    """Small fake instrument with a thread-safe, externally inspectable call log."""
-
-    cfg = _Cfg()
-
-    def __init__(self):
-        self._calls = []
-        self._lock = threading.Lock()
-        self._reset_state()
-        self._reset_session()
-        self.serial_worker = _RecordingSerialWorker(self)
-        for name in (
-            "sig_stop_movement", "sig_state_request", "sig_state_request_and_wait_until_done",
-            "sig_load_sample", "sig_unload_sample", "sig_center_sample", "sig_save_etl_config",
-        ):
-            setattr(self, name, _RecordingSignal(self, name))
-
-    def _reset_state(self):
-        """Start each test from the production state contract, not a dict.
-
-        x is parked one micron inside its 25000 limit so a +2 relative move is a genuine
-        envelope breach, and theta is present because TransportConfig gives it a range.
-        """
-        self.state = FakeState(
-            position={
-                "x_pos": 24999.0,
-                "y_pos": 0.0,
-                "z_pos": 0.0,
-                "f_pos": 1000.0,
-                "theta_pos": 0.0,
-            },
-            shutterconfig="Left",
-            ETL_cfg_file="etl.csv",
-        )
-
-    def reset(self):
-        with self._lock:
-            self._calls.clear()
-            self._reset_state()
-            self._reset_session()
-
-    def _reset_session(self):
-        """Replace the whole session, exactly as the real Core builds it in __init__.
-
-        A test must inherit neither the previous one's busy gate nor its saved acquisition
-        list -- a standalone acquire_finish would otherwise restore a list from another test.
-        Replacing the container is also how the production code is allowed to treat it: reads
-        never create it, so it must already be there.
-        """
-        self._remote_session = {"operation": None, "counter": 0, "snapshot": None}
-
-    def calls(self):
-        with self._lock:
-            return list(self._calls)
-
-    def _record(self, name, *args, **kwargs):
-        with self._lock:
-            self._calls.append((name, args, kwargs))
-
-    def move_absolute(self, *args, **kwargs):
-        self._record("move_absolute", *args, **kwargs)
-        for key, value in args[0].items():
-            self.state["position"][key.replace("_abs", "_pos")] = float(value)
-
-    def move_relative(self, *args, **kwargs):
-        # A synchronous remote call must use serial_worker.move_relative directly.
-        # Reaching this Core method reproduces the old signal/early-return path.
-        self._record("core_move_relative_fallback", *args, **kwargs)
-
-    def state_request_handler(self, *args, **kwargs):
-        self._record("state_request_handler", *args, **kwargs)
-        self.state.set_parameters(args[0])  # production state has no dict .update()
-
-    def set_filter(self, *args, **kwargs):
-        self._record("set_filter", *args, **kwargs)
-        self.state["filter"] = args[0]
-
-    def set_zoom(self, *args, **kwargs):
-        self._record("set_zoom", *args, **kwargs)
-        self.state["zoom"] = args[0]
-
-    def set_laser(self, *args, **kwargs):
-        self._record("set_laser", *args, **kwargs)
-        self.state["laser"] = args[0]
-
-    def set_intensity(self, *args, **kwargs):
-        self._record("set_intensity", *args, **kwargs)
-        self.state["intensity"] = args[0]
-
-    def set_shutterconfig(self, *args, **kwargs):
-        self._record("set_shutterconfig", *args, **kwargs)
-        self.state["shutterconfig"] = args[0]
-
-    def run_time_lapse(self, *args, **kwargs):
-        self._record("run_time_lapse", *args, **kwargs)
-
-    def zero_axes(self, *args, **kwargs):
-        self._record("zero_axes", *args, **kwargs)
-
-    def unzero_axes(self, *args, **kwargs):
-        self._record("unzero_axes", *args, **kwargs)
-
-    def stop(self, *args, **kwargs):
-        self._record("stop", *args, **kwargs)
-        self.state["state"] = "idle"
-
-    def open_shutters(self, *args, **kwargs):
-        self._record("open_shutters", *args, **kwargs)
-        self.state["shutterstate"] = True
-
-    def close_shutters(self, *args, **kwargs):
-        self._record("close_shutters", *args, **kwargs)
-        self.state["shutterstate"] = False
-
-    def start(self, *args, **kwargs):
-        self._record("start", *args, **kwargs)
-        self.state["state"] = "run_acquisition_list"
-
-    def preview_acquisition(self, *args, **kwargs):
-        self._record("preview_acquisition", *args, **kwargs)
-
-    def snap(self, *args, **kwargs):
-        self._record("snap", *args, **kwargs)
-
-    def set_state(self, *args, **kwargs):
-        self._record("set_state", *args, **kwargs)
-        self.state["state"] = args[0]
-
-    def execute_galil_program(self, *args, **kwargs):
-        self._record("execute_galil_program", *args, **kwargs)
-
-    def get_free_disk_space(self, *args, **kwargs):
-        self._record("get_free_disk_space", *args, **kwargs)
-        return 1_000_000_000
-
-    def get_required_disk_space(self, *args, **kwargs):
-        self._record("get_required_disk_space", *args, **kwargs)
-        return 0
-
-    def check_motion_limits(self, *args, **kwargs):
-        self._record("check_motion_limits", *args, **kwargs)
-        return []
-
-    def stop_time_lapse(self, *args, **kwargs):
-        self._record("stop_time_lapse", *args, **kwargs)
-
-
-class _RecordingSerialWorker:
-    def __init__(self, core):
-        self.core = core
-
-    def move_relative(self, *args, **kwargs):
-        self.core._record("move_relative", *args, **kwargs)
-        for key, value in args[0].items():
-            pos_key = key.replace("_rel", "_pos")
-            self.core.state["position"][pos_key] += float(value)
-
-
-class _RecordingSignal:
-    def __init__(self, core, name):
-        self.core = core
-        self.name = name
-
-    def emit(self, *args):
-        self.core._record(self.name, *args)
-        if self.name in {"sig_state_request", "sig_state_request_and_wait_until_done"}:
-            settings = args[0]
-            if "ETL_cfg_file" in settings:
-                self.core.state["ETL_cfg_file"] = settings["ETL_cfg_file"]
-
-
-_core = _RecordingCore()
-_tcp_server = None
-_tcp_thread = None
-_mcp_server = None
-_mcp_thread = None
-_tcp_port = None
-_mcp_port = None
-_original_defer = vrc._defer
-
-
-class _TransportTCPServer(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-
-class _TCPHandler(socketserver.BaseRequestHandler):
-    """Socket shell matching the production Qt server's framing/auth/dispatch flow."""
-
-    def handle(self):
-        self.request.settimeout(REQUEST_TIMEOUT)
-        decoder = srv.FrameDecoder()
-        auth = srv.AuthGate(TOKEN)
-        while True:
-            try:
-                chunk = self.request.recv(65536)
-            except (ConnectionError, OSError, socket.timeout):
-                return
-            if not chunk:
-                return
-            decoder.feed(chunk)
-            try:
-                for payload in decoder.frames():
-                    message = payload.decode("utf-8", "replace")
-                    if not auth.passed:
-                        reply = "OK" if auth.check(message) else "AUTH-FAILED"
-                        self.request.sendall(srv.frame(reply))
-                        if reply != "OK":
-                            return
-                    else:
-                        try:
-                            self.request.sendall(srv.frame(srv.handle_tcp_message(_core, message)))
-                        except (ConnectionError, OSError):
-                            return
-            except srv.FramingError as exc:
-                try:
-                    self.request.sendall(srv.frame(f"framing error: {exc}"))
-                except (ConnectionError, OSError):
-                    pass
-                return
-
-
-def _run_immediately(function, *args, **kwargs):
-    """Stand in for the Qt-deferred call: these tests have no event loop to drain."""
-    return function(*args, **kwargs)
-
-
-def setup_module(_module=None):
-    global _tcp_server, _tcp_thread, _mcp_server, _mcp_thread, _tcp_port, _mcp_port
-    if _tcp_server is not None or _mcp_server is not None:
-        return
-    vrc._defer = _run_immediately
-    _tcp_server = _TransportTCPServer(("127.0.0.1", 0), _TCPHandler)
-    _tcp_port = _tcp_server.server_address[1]
-    _tcp_thread = threading.Thread(target=_tcp_server.serve_forever, daemon=True)
-    _tcp_thread.start()
-
-    config = types.SimpleNamespace(
-        token=TOKEN,
-        quiet=True,
-        timeout=REQUEST_TIMEOUT,
-        mesospim_host="127.0.0.1",
-        mesospim_port=_tcp_port,
-        mesospim_token=TOKEN,
-    )
-    _mcp_server = ThreadingHTTPServer(("127.0.0.1", 0), srv.make_mcp_handler(config))
-    _mcp_port = _mcp_server.server_address[1]
-    _mcp_thread = threading.Thread(target=_mcp_server.serve_forever, daemon=True)
-    _mcp_thread.start()
+_h = Harness()
 
 
 def teardown_module(_module=None):
-    global _tcp_server, _tcp_thread, _mcp_server, _mcp_thread, _tcp_port, _mcp_port
-    for server in (_mcp_server, _tcp_server):
-        if server is not None:
-            server.shutdown()
-            server.server_close()
-    for thread in (_mcp_thread, _tcp_thread):
-        if thread is not None:
-            thread.join(timeout=1.0)
-    _tcp_server = _tcp_thread = _mcp_server = _mcp_thread = None
-    _tcp_port = _mcp_port = None
-    vrc._defer = _original_defer
+    _h.stop()
 
 
-def _mcp_http(body, *, token=TOKEN, origin="http://127.0.0.1", path="/mcp"):
-    headers = {"Content-Type": "application/json"}
+@pytest.fixture(autouse=True)
+def _fresh_core():
+    _h.reset()
+
+
+def _refused(lane, name, args, code=None):
+    """Invoke and assert a typed refusal that never touched the Core."""
+    before = _h.core.calls()
+    ok, payload = _h.invoke(lane, name, args)
+    assert not ok, (lane, name, payload)
+    if code is not None:
+        assert payload["code"] == code, (lane, name, payload)
+    assert _h.core.calls() == before, (lane, name, _h.core.calls())
+    return payload
+
+
+def _both(name, args, code=None):
+    return {lane: _refused(lane, name, args, code) for lane in ("mcp", "tcp")}
+
+
+# --- raw HTTP helpers over the live MCP loopback (custom Origin / Authorization / headers) ---
+
+def _jsonrpc(port, obj, *, token=TOKEN):
+    body = json.dumps(obj).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Origin": "http://127.0.0.1"}   # always a good origin
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
-    if origin is not None:
-        headers["Origin"] = origin
     request = urllib.request.Request(
-        f"http://127.0.0.1:{_mcp_port}{path}",
-        data=body if isinstance(body, bytes) else body.encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    # Windows can very occasionally report WSAECONNABORTED when the local
-    # HTTP server rejects a request before consuming its body. Retry that one
-    # loopback transport condition once; all protocol errors and timeouts
-    # still fail immediately, so the adversarial suite remains tightly bounded.
-    for attempt in range(2):
-        try:
-            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-                return response.status, response.read()
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
-        except ConnectionAbortedError:
-            if attempt:
-                raise
-
-
-def _mcp_tool(name, arguments):
-    body = json.dumps({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": name, "arguments": arguments},
-    }, allow_nan=True)
-    status, raw = _mcp_http(body)
-    reply = json.loads(raw) if raw else None
-    return status, reply
-
-
-def _mcp_rejected(name, arguments):
-    before = _core.calls()
-    status, reply = _mcp_tool(name, arguments)
-    if status == 200:
-        assert reply["result"]["isError"] is True, reply
-    else:
-        assert status == 400, (status, reply)
-    assert _core.calls() == before, f"MCP rejection reached Core: {_core.calls()!r}"
-
-
-def _tcp_connect(token=TOKEN):
-    sock = socket.create_connection(("127.0.0.1", _tcp_port), timeout=REQUEST_TIMEOUT)
-    sock.settimeout(REQUEST_TIMEOUT)
-    sock.sendall(srv.frame(token))
-    return sock, srv.read_frame(sock)
-
-
-def _read_tcp_frames(sock, count):
-    """Read multiple pipelined replies without discarding coalesced frames."""
-    buffer = b""
-    replies = []
-    while len(replies) < count:
-        while b"\n" not in buffer:
-            chunk = sock.recv(4096)
-            if not chunk:
-                raise ConnectionError("TCP server closed before all replies arrived")
-            buffer += chunk
-        head, _, payload = buffer.partition(b"\n")
-        if not head or not head.isdigit():
-            raise srv.FramingError("expected canonical byte-count header")
-        length = int(head)
-        while len(payload) < length:
-            chunk = sock.recv(4096)
-            if not chunk:
-                raise ConnectionError("TCP server closed inside a reply")
-            payload += chunk
-        replies.append(payload[:length].decode(srv.ENCODING, "replace"))
-        buffer = payload[length:]
-    return replies
-
-
-def _tcp_call(payload):
-    sock, auth = _tcp_connect()
+        f"http://127.0.0.1:{port}/mcp", data=body, headers=headers, method="POST")
     try:
-        assert auth == "OK"
-        text = payload if isinstance(payload, str) else json.dumps(payload, allow_nan=True)
-        sock.sendall(srv.frame(text))
-        return srv.read_frame(sock)
-    finally:
-        sock.close()
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as reply:
+            return reply.status, json.loads(reply.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        return error.code, None
 
 
-def _tcp_rejected(name, arguments):
-    before = _core.calls()
-    reply = _tcp_call({name: arguments})
-    assert not reply.startswith(srv.OK_MARKER), reply
-    assert _core.calls() == before, f"TCP rejection reached Core: {_core.calls()!r}"
+def _raw(body, *, auth, origin="http://127.0.0.1", extra=(), shutdown_write=False):
+    headers = ["Content-Type: application/json"]
+    if origin is not None:
+        headers.append(f"Origin: {origin}")
+    if auth is not None:
+        headers.append(f"Authorization: {auth}")
+    headers.extend(extra)
+    status, _ = _h.mcp.raw(headers, body, shutdown_write=shutdown_write, timeout=REQUEST_TIMEOUT)
+    return status
 
 
-def _raw_http(headers, body=b"", *, shutdown_write=False):
-    sock = socket.create_connection(("127.0.0.1", _mcp_port), timeout=REQUEST_TIMEOUT)
-    sock.settimeout(REQUEST_TIMEOUT)
-    lines = [b"POST /mcp HTTP/1.1", b"Host: 127.0.0.1", b"Connection: close"]
-    lines.extend(h.encode("ascii") for h in headers)
-    sock.sendall(b"\r\n".join(lines) + b"\r\n\r\n" + body)
-    if shutdown_write:
-        sock.shutdown(socket.SHUT_WR)
-    chunks = []
-    try:
-        while True:
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-    except socket.timeout:
-        pass
-    finally:
-        sock.close()
-    response = b"".join(chunks)
-    status = int(response.split(b" ", 2)[1]) if response.startswith(b"HTTP/") else None
-    return status, response
+# ============================ representative attack classes ============================
 
-
-HOSTILE_NAMES = [
-    "__class__", "__globals__", "__import__", "eval", "exec", "compile",
-    "os.system('calc')", "subprocess.Popen", "COMMANDS", "run", "_validate",
-    "move_absolute\x00", "move_absolute\r\nX-Evil: yes", "MOVE_ABSOLUTE",
-    " move_absolute", "move_absolute ", "move\u202eetulosba", "m\u043eve_absolute",
-    "..", "*", "", "\ud800", "A" * 4096,
-]
-
-
-def test_attack_corpus_is_deliberately_bounded():
-    assert REQUEST_TIMEOUT <= 0.6
-    assert len(HOSTILE_NAMES) < MAX_FUZZ_CASES
-    assert MAX_ACCEPTED_BODY <= 1 << 20
-
-
-def test_hostile_names_are_rejected_over_mcp_and_tcp_without_core_touch():
-    _core.reset()
-    for name in HOSTILE_NAMES:
-        _mcp_rejected(name, {})
-        _tcp_rejected(name, {})
-
-
-def test_seeded_unicode_and_delimiter_fuzz_is_bounded_and_rejected_on_both_lanes():
-    rng = random.Random(0x5EED)
-    alphabet = ["a", "Z", "_", ".", "/", "\\", "\x00", "\n", "\t", "м", "K", "／"]
-    names = set()
-    while len(names) < MAX_FUZZ_CASES:
-        name = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 32)))
-        if name not in vrc.COMMANDS:
-            names.add(name)
-    _core.reset()
-    for name in sorted(names):
-        _mcp_rejected(name, {"targets": {"x": 0}})
-        _tcp_rejected(name, {"targets": {"x": 0}})
-
-
-def test_limit_type_and_shape_bypasses_fail_over_both_transports():
-    attacks = [
-        ("move_absolute", {"targets": {"x": 25000.0000001}}),
-        ("move_absolute", {"targets": {"x": -25000.0000001}}),
-        ("move_absolute", {"targets": {"y": 50001}}),
-        ("move_absolute", {"targets": {"z": -25001}}),
-        ("move_absolute", {"targets": {"f": -1}}),
-        ("move_absolute", {"targets": {"x": True}}),
-        ("move_absolute", {"targets": {"x": "0"}}),
-        ("move_absolute", {"targets": {"x": [0]}}),
-        ("move_absolute", {"targets": {"__proto__": 0}}),
-        ("move_absolute", {"targets": {}}),
-        ("set_intensity", {"intensity": -1}),
-        ("set_intensity", {"intensity": 101}),
-        ("set_intensity", {"intensity": False}),
-        ("set_filter", {"filter": "Empty\x00"}),
-        ("set_state", {"settings": {"x_max": 999999999}}),
-        ("snap", {"write": True}),
-        ("get_snap_image", {"offset": -1}),
-        ("get_snap_image", {"max_bytes": 512 * 1024 + 1}),
-    ]
-    _core.reset()
-    for name, arguments in attacks:
-        _mcp_rejected(name, arguments)
-        _tcp_rejected(name, arguments)
-
-
-def test_nonfinite_numbers_never_reach_even_unbounded_numeric_handlers():
-    _core.reset()
-    for value in (float("nan"), float("inf"), float("-inf"), 1e309, -1e309):
-        for name, arguments in (
-            ("set_etl", {"etl_l_amplitude": value}),
-            ("set_camera", {"camera_exposure_time": value}),
-            ("move_relative", {"deltas": {"x": value}}),
-        ):
-            _mcp_rejected(name, arguments)
-            _tcp_rejected(name, arguments)
-
-
-def test_relative_move_cannot_cross_absolute_envelope_on_either_transport():
-    _core.reset()
-    # Fake Core starts at x=24999, so +2 would land at 25001 beyond x_max=25000.
-    arguments = {"deltas": {"x": 2}}
-    _mcp_rejected("move_relative", arguments)
-    _tcp_rejected("move_relative", arguments)
-
-
-def test_mcp_auth_bypass_matrix_is_401_and_never_forwards():
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                       "params": {"name": "move_absolute", "arguments": {"targets": {"x": 0}}}})
-    wrong = [None, "", "harsh-MCP+TCP-token", TOKEN + " ", " " + TOKEN,
-             TOKEN.upper(), TOKEN + "\x00", "Bearer " + TOKEN]
-    _core.reset()
-    for candidate in wrong:
-        status, _ = _mcp_http(body, token=candidate)
-        assert status == 401, (candidate, status)
-        assert _core.calls() == []
-
-
-def test_mcp_origin_bypass_matrix_is_403_and_never_forwards():
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                       "params": {"name": "move_absolute", "arguments": {"targets": {"x": 0}}}})
-    hostile = [
-        "null", "http://evil.example", "http://localhost.evil.example",
-        "http://127.0.0.1.evil", "http://127.0.0.1:42100",
-        "http://user@localhost", "HTTP://LOCALHOST", "http://localhost.",
-        "https://localhost@evil.example", "file://localhost",
-    ]
-    _core.reset()
-    for origin in hostile:
-        status, _ = _mcp_http(body, origin=origin)
-        assert status == 403, (origin, status)
-        assert _core.calls() == []
-
-
-def test_duplicate_security_headers_fail_closed_before_forwarding():
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                       "params": {"name": "move_absolute", "arguments": {"targets": {"x": 0}}}}).encode()
-    base = ["Content-Type: application/json", f"Content-Length: {len(body)}"]
-    _core.reset()
-    status, _ = _raw_http(base + [
-        f"Authorization: Bearer {TOKEN}",
-        "Authorization: Bearer definitely-wrong",
-        "Origin: http://127.0.0.1",
-    ], body)
-    assert status == 401
-    assert _core.calls() == []
-
-    status, _ = _raw_http(base + [
-        f"Authorization: Bearer {TOKEN}",
-        "Origin: http://127.0.0.1",
-        "Origin: http://evil.example",
-    ], body)
-    assert status == 403
-    assert _core.calls() == []
-
-
-def test_duplicate_json_members_are_rejected_on_mcp_and_tcp():
-    _core.reset()
-    mcp = (
-        '{"jsonrpc":"2.0","id":1,"method":"tools/call",'
-        '"params":{"name":"move_absolute","arguments":{"targets":{"x":25001,"x":0}}}}'
-    )
-    status, _ = _mcp_http(mcp)
-    assert status == 400
-    assert _core.calls() == []
-
-    tcp = '{"move_absolute":{"targets":{"x":25001,"x":0}}}'
-    reply = _tcp_call(tcp)
-    assert not reply.startswith(srv.OK_MARKER)
-    assert _core.calls() == []
-
-
-def test_mcp_malformed_json_batch_and_bad_params_never_forward_or_kill_server():
-    bodies = [
-        b"", b"{", b"[]", b"null", b"true", b"\xff\xfe",
-        b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":[]}',
-        b'[{"jsonrpc":"2.0","id":1,"method":"tools/list"}]',
-        b'{"jsonrpc":"2.0","method":"tools/call","params":{"name":"move_absolute",'
-        b'"arguments":{"targets":{"x":0}}}}',
-    ]
-    _core.reset()
-    for body in bodies:
-        status, _ = _mcp_http(body)
-        assert status in (200, 202, 400), status
-        assert _core.calls() == []
-    status, reply = _mcp_tool("get_state", {})
-    assert status == 200 and reply["result"]["isError"] is False
-
-
-def test_mcp_oversized_body_is_rejected_before_read_or_forward():
-    _core.reset()
-    start = time.monotonic()
-    status, _ = _raw_http([
-        f"Authorization: Bearer {TOKEN}",
-        "Origin: http://127.0.0.1",
-        "Content-Type: application/json",
-        f"Content-Length: {MAX_ACCEPTED_BODY + 1}",
-    ], shutdown_write=True)
-    assert status == 413
-    assert time.monotonic() - start < REQUEST_TIMEOUT
-    assert _core.calls() == []
-
-
-def test_tcp_auth_confusion_fails_closed_without_core_touch():
-    _core.reset()
-    for token in ("", TOKEN + " ", " " + TOKEN, TOKEN.upper(), TOKEN + "\x00"):
-        sock, reply = _tcp_connect(token)
-        try:
-            assert reply == "AUTH-FAILED"
-        finally:
-            sock.close()
-        assert _core.calls() == []
-
-
-def test_tcp_bad_and_oversized_frame_headers_fail_fast_without_core_touch():
-    _core.reset()
-    for malformed in (b"abc\n", b"-1\n", b"12x\n", b"+1\nX", b"1 0\n"):
-        sock, auth = _tcp_connect()
-        try:
-            assert auth == "OK"
-            sock.sendall(malformed)
-            reply = srv.read_frame(sock)
-            assert reply.startswith("framing error:"), reply
-        finally:
-            sock.close()
-        assert _core.calls() == []
-
-    sock, auth = _tcp_connect()
-    try:
-        assert auth == "OK"
-        start = time.monotonic()
-        sock.sendall(str(MAX_ACCEPTED_BODY + 1).encode("ascii") + b"\n")
-        reply = srv.read_frame(sock)
-        assert reply.startswith("framing error:"), reply
-        assert time.monotonic() - start < REQUEST_TIMEOUT
-    finally:
-        sock.close()
-    assert _core.calls() == []
-
-
-def test_tcp_invalid_utf8_and_pipelined_attacks_do_not_poison_next_call():
-    _core.reset()
-    sock, auth = _tcp_connect()
-    try:
-        assert auth == "OK"
-        bad_utf8 = b'{"move_\xffabsolute":{"targets":{"x":0}}}'
-        hostile = json.dumps({"__import__": {}}).encode()
-        healthy = json.dumps({"get_state": {}}).encode()
-        sock.sendall(srv.frame(bad_utf8) + srv.frame(hostile) + srv.frame(healthy))
-        first, second, third = _read_tcp_frames(sock, 3)
-        assert not first.startswith(srv.OK_MARKER)
-        assert not second.startswith(srv.OK_MARKER)
-        assert third.startswith(srv.OK_MARKER)
-    finally:
-        sock.close()
-    assert _core.calls() == []
-
-
-def _operation_call(lane, name, arguments):
-    if lane == "mcp":
-        status, reply = _mcp_tool(name, arguments)
-        assert status == 200
-        result = reply["result"]
-        payload = json.loads(result["content"][0]["text"])
-        return not result["isError"], payload
-    reply = _tcp_call({name: arguments})
-    if reply.startswith(srv.OK_MARKER):
-        return True, json.loads(reply[len(srv.OK_MARKER):])
-    return False, {"error": reply}
-
-
-@pytest.mark.parametrize("lane", ["mcp", "tcp"])
-def test_preview_completes_on_blocking_return_at_idle(lane):
-    """Preview has no sig_finished, so its blocking return is the completion proof."""
-    _core.reset()
-    _core.sig_finished = object()
-    try:
-        ok, reply = _operation_call(
-            lane, "preview_acquisition", {"row": 0, "z_update": True})
-        assert ok, reply
-        assert reply["accepted"] is True
-        assert reply["operation"]["status"] == "completed"
-        preview = [call for call in _core.calls() if call[0] == "preview_acquisition"][-1]
-        assert preview[2]["z_update"] is True
-    finally:
-        delattr(_core, "sig_finished")
-        _core.reset()
-
-
-@pytest.mark.parametrize("lane", ["mcp", "tcp"])
-def test_stopping_finished_time_lapse_does_not_leave_stuck_gate(lane):
-    """An idempotent stop has no future cancellation signal to wait for."""
-    _core.reset()
-    _core.state["state"] = "run_acquisition_list"
-    _core.timelapse_active = False
-    _core.sig_time_lapse_finished = object()
-    try:
-        ok, reply = _operation_call(lane, "time_lapse_stop", {})
-        assert ok, reply
-        assert reply["operation"]["status"] == "completed"
-    finally:
-        delattr(_core, "timelapse_active")
-        delattr(_core, "sig_time_lapse_finished")
-        _core.reset()
-
-
-@pytest.mark.parametrize("lane", ["mcp", "tcp"])
-def test_idle_stop_is_idempotent_and_does_not_reabort_workers(lane):
-    _core.reset()
-    ok, reply = _operation_call(lane, "stop_activity", {})
-    assert ok, reply
-    assert reply["operation"]["status"] == "completed"
-    assert reply["state"] == "idle"
-    assert _core.calls() == []
-
-
-@pytest.mark.parametrize("first_lane,second_lane", [("mcp", "tcp"), ("tcp", "mcp")])
-def test_busy_gate_acknowledges_rejects_reports_and_releases_across_lanes(
-        first_lane, second_lane):
-    """One active operation serializes MCP/TCP while reads and emergency stop remain live."""
-    _core.reset()
-    _core.sig_finished = object()  # makes start_live genuinely asynchronous to the gate
-    try:
-        ok, accepted = _operation_call(first_lane, "start_live", {})
-        assert ok
-        assert accepted["accepted"] is True
-        assert accepted["accepted_command"] == "start_live"
-        operation = accepted["operation"]
-        assert operation["status"] == "processing"
-        assert operation["command"] == "start_live"
-
-        before = _core.calls()
-        ok, rejected = _operation_call(second_lane, "set_intensity", {"intensity": 20})
-        assert not ok
-        assert "system busy" in rejected["error"]
-        assert "start_live" in rejected["error"]
-        assert operation["id"] in rejected["error"]
-        assert _core.calls() == before
-
-        ok, progress = _operation_call(second_lane, "get_progress", {})
-        assert ok
-        assert progress["operation"]["id"] == operation["id"]
-        assert progress["operation"]["status"] == "processing"
-
-        ok, stopping = _operation_call(second_lane, "stop_activity", {})
-        assert ok
-        assert stopping["accepted"] is True
-        assert stopping["accepted_command"] == "stop_activity"
-        assert stopping["operation"]["status"] == "stopping"
-
-        assert vrc.complete_operation(_core, "finished") is True
-        ok, completed = _operation_call(first_lane, "get_progress", {})
-        assert ok
-        assert completed["operation"]["status"] == "completed"
-
-        ok, next_call = _operation_call(second_lane, "set_intensity", {"intensity": 20})
-        assert ok
-        assert next_call["accepted"] is True
-        assert next_call["operation"]["status"] == "completed"
-        assert _core.state["intensity"] == 20
-    finally:
-        delattr(_core, "sig_finished")
-        _core.reset()
-
-
-def test_busy_gate_bounded_concurrent_burst_is_atomic_across_mcp_and_tcp():
-    """A mixed 24-call burst cannot leak a second mutation through the active gate."""
-    _core.reset()
-    _core.sig_finished = object()
-    try:
-        ok, accepted = _operation_call("mcp", "start_live", {})
-        assert ok, accepted
-        operation = accepted["operation"]
-        assert operation["status"] == "processing"
-        before = _core.calls()
-
-        attempts = []
-        for index in range(BUSY_STRESS_MUTATIONS):
-            attempts.append(("mutation", "mcp" if index % 2 == 0 else "tcp"))
-            if index < BUSY_STRESS_READS:
-                attempts.append(("read", "tcp" if index % 2 == 0 else "mcp"))
-        release = threading.Event()
-
-        def attempt(item):
-            release.wait()
-            kind, lane = item
-            if kind == "mutation":
-                return kind, lane, _operation_call(
-                    lane, "set_intensity", {"intensity": 20})
-            return kind, lane, _operation_call(lane, "get_progress", {})
-
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(attempt, item) for item in attempts]
-            release.set()
-            results = [future.result() for future in futures]
-
-        for kind, _lane, (call_ok, reply) in results:
-            if kind == "mutation":
-                assert not call_ok, reply
-                assert "system busy" in reply["error"]
-                assert operation["id"] in reply["error"]
-                assert operation["command"] in reply["error"]
-            else:
-                assert call_ok, reply
-                assert reply["operation"]["id"] == operation["id"]
-                assert reply["operation"]["status"] == "processing"
-        assert _core.calls() == before
-
-        assert vrc.complete_operation(_core, "finished") is True
+def test_hostile_names_refused_both_lanes():
+    for name in ("__class__", "os.system('x')", "move_absolute\x00", "A" * 4096):
         for lane in ("mcp", "tcp"):
-            ok, next_call = _operation_call(
-                lane, "set_intensity", {"intensity": 20})
-            assert ok, next_call
-            assert next_call["operation"]["status"] == "completed"
-    finally:
-        delattr(_core, "sig_finished")
-        _core.reset()
+            payload = _refused(lane, name, {})
+            assert payload["code"] in ("unknown_command", "validation"), (name, payload)
 
 
-@pytest.mark.parametrize("lane", ["mcp", "tcp"])
-def test_set_state_cannot_smuggle_an_unknown_state_machine_mode(lane):
-    _core.reset()
-    before = _core.calls()
-    ok, reply = _operation_call(
-        lane, "set_state", {"settings": {"state": "__invalid_remote_state__"}})
-    assert not ok, reply
-    assert "not one of" in reply["error"]
-    assert _core.calls() == before
-    assert _core.state["state"] == "idle"
+@pytest.mark.parametrize("name", sorted(UNEXPECTED_ARGUMENT_CASES))
+def test_every_command_rejects_unexpected_input_over_both_lanes(name):
+    _both(name, UNEXPECTED_ARGUMENT_CASES[name], code="validation")
 
 
-def test_both_servers_remain_healthy_after_the_full_attack_corpus():
-    status, reply = _mcp_tool("get_state", {})
-    assert status == 200 and reply["result"]["isError"] is False
-    assert _tcp_call({"get_state": {}}).startswith(srv.OK_MARKER)
+def test_malformed_envelopes_refused():
+    _both("move_absolute", {"targets": 5})              # non-object args value
+    for lane in ("mcp", "tcp"):
+        # a multi-key / non-object / bare-scalar envelope is rejected at parse_call. Drive the raw
+        # wire so the envelope itself is malformed, not just an argument.
+        if lane == "tcp":
+            for bad in ('{"a":{},"b":{}}', '[]', 'null', '""'):
+                conn = _h.tcp.new_conn(authed=True)
+                _h.tcp.adapter._handle(conn, bad)
+                assert not last_frame(conn).startswith(config.OK_MARKER), bad
+        else:
+            for bad in ('{"a":{},"b":{}}', "[]", "null", '""'):
+                status, reply = _jsonrpc(_h.mcp.port, {"jsonrpc": "2.0", "id": 1,
+                    "method": "tools/call", "params": {"name": "move_absolute", "arguments": bad}})
+                assert status == 200 and reply["result"]["isError"] is True, bad
+    assert _h.core.calls() == []
 
 
-if __name__ == "__main__":
-    setup_module()
+def test_mcp_rejects_non_object_arguments():
+    # MCP once coerced a falsy non-object (`[]`) to {} and accepted it, while TCP rejected
+    # the analogous call. Both must now refuse it, and the Core must stay untouched.
+    status, reply = _jsonrpc(_h.mcp.port, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "ping", "arguments": []}})
+    assert status == 200 and reply["result"]["isError"] is True, reply
+    assert _h.core.calls() == []
+
+
+@pytest.mark.parametrize("message,code", [
+    ([], -32600),
+    ({"id": 1, "method": "tools/list"}, -32600),
+    ({"jsonrpc": "1.0", "id": 1, "method": "tools/list"}, -32600),
+    ({"jsonrpc": "2.0", "id": None, "method": "tools/list"}, -32600),
+    ({"jsonrpc": "2.0", "id": True, "method": "tools/list"}, -32600),
+    ({"jsonrpc": "2.0", "id": 1, "method": None}, -32600),
+    ({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": []}, -32602),
+])
+def test_mcp_jsonrpc_envelope_is_strict(message, code):
+    status, reply = _jsonrpc(_h.mcp.port, message)
+    assert status == 200
+    assert reply["jsonrpc"] == "2.0"
+    assert reply["error"]["code"] == code
+    assert _h.core.calls() == []
+
+
+def test_mcp_notification_is_accepted_without_hardware_dispatch():
+    body = json.dumps({"jsonrpc": "2.0", "method": "tools/call", "params": {
+        "name": "set_intensity", "arguments": {"intensity": 50}}}).encode()
+    status = _raw(body, auth=f"Bearer {TOKEN}", extra=[f"Content-Length: {len(body)}"])
+    assert status == 202
+    assert _h.core.calls() == []
+
+
+def test_axis_breach_refused():
+    for value in (25001, -25001):
+        results = _both("move_absolute", {"targets": {"x": value}}, code="validation")
+        for payload in results.values():
+            assert "25000" in payload["error"], payload      # the message names the limit
+
+
+def test_relative_move_cannot_cross_envelope():
+    # the core starts at x=24999, so +2 lands at 25001, one micron past x_max=25000.
+    _both("move_relative", {"deltas": {"x": 2}}, code="validation")
+
+
+def test_nonfinite_numbers_refused():
+    # A non-finite number is rejected by strict_json_loads, which runs at
+    # DIFFERENT layers per lane. Over TCP parse_call wraps it as a typed 'validation' error; over
+    # MCP the whole request body is strict-parsed inside do_POST, so it returns HTTP 400 BEFORE
+    # dispatch -- no tools/call isError envelope exists. Both refuse and neither touches the Core.
+    for value in (float("nan"), float("inf"), 1e309):
+        for name, args in (("move_relative", {"deltas": {"x": value}}),    # bounded axis handler
+                           ("set_etl", {"etl_l_amplitude": value})):       # hardware numeric
+            _refused("tcp", name, args, code="validation")
+            body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": name, "arguments": args}}).encode()     # allow_nan default
+            assert _raw(body, auth=f"Bearer {TOKEN}",
+                        extra=[f"Content-Length: {len(body)}"]) == 400, (name, value)
+    assert _h.core.calls() == []
+
+
+def test_type_confusion_refused():
+    _both("move_absolute", {"targets": {"x": True}}, code="validation")   # bool is not a number
+    _both("set_intensity", {"intensity": "50"}, code="validation")        # string is not a number
+    _both("move_absolute", {"targets": {}}, code="validation")            # empty targets
+
+
+def test_limits_are_not_writable():
+    for verb in ("set_limits", "set_stage_parameters", "set_stage_limits", "set_axis_limits"):
+        assert verb not in dispatcher.COMMANDS
+    results = _both("set_state", {"settings": {"x_max": 999999}}, code="validation")
+    for payload in results.values():
+        assert "x_max" in payload["error"], payload
+
+    before = _h.core.calls()
+    first = _h.invoke("mcp", "get_limits", {})[1]
+    second = _h.invoke("mcp", "get_limits", {})[1]
+    assert first == second                              # a pure read, twice identical
+    assert _h.core.calls() == before                    # get_limits makes no Core call
+    assert first["enforced"]["axes"]["x"] == [-25000.0, 25000.0]
+
+
+def test_acquisition_abuse_refused():
+    for entry in ("acquire_start",):
+        _both(entry, {"acquisition": {"filter": "NOPE"}}, code="validation")
+        _both(entry, {"acquisition": {"x_pos": 999999}}, code="validation")
+    _both("set_acquisition_list", {"acquisitions": [{"filter": "NOPE"}]}, code="validation")
+    _both("set_acquisition_list", {"acquisitions": [{"x_pos": 999999}]}, code="validation")
+    _both("set_acquisition_list", {"acquisitions": []}, code="validation")
+
+
+def test_upstream_plane_metadata_mismatch_round_trips_over_both_lanes():
+    row = {"z_start": 0, "z_end": 100, "z_step": 10, "planes": 10}
+    for lane in ("mcp", "tcp"):
+        _h.reset()
+        ok, installed = _h.invoke(lane, "set_acquisition_list", {
+            "acquisitions": [row], "selected_row": 0})
+        assert ok and installed["count"] == 1, (lane, installed)
+        ok, snapshot = _h.invoke(lane, "get_acquisition_list", {})
+        assert ok and snapshot["acquisitions"][0]["planes"] == 10, (lane, snapshot)
+        ok, restored = _h.invoke(lane, "set_acquisition_list", {
+            "acquisitions": snapshot["acquisitions"], "selected_row": 0})
+        assert ok and restored["count"] == 1, (lane, restored)
+
+
+def test_live_tcp_normal_calls_use_the_configured_timeout(monkeypatch):
+    seen = []
+
+    class Client:
+        def __init__(self, _host, _port, _token, timeout):
+            seen.append(timeout)
+
+        def call(self, _name, **_arguments):
+            return {"pong": True}
+
+        def close(self):
+            pass
+
+    monkeypatch.setenv("MESOSPIM_LIVE_TCP_HOST", "127.0.0.1")
+    monkeypatch.setenv("MESOSPIM_LIVE_TCP_PORT", "42000")
+    monkeypatch.setenv("MESOSPIM_LIVE_TCP_TOKEN", "secret")
+    monkeypatch.setattr(live_adversarial, "RemoteControl", Client)
+    tool, _tcp = live_adversarial._make_tool(
+        "tcp", "127.0.0.1", 42100, "unused", request_timeout=17.0)
+
+    assert tool("ping") == (True, {"pong": True})
+    assert seen == [17.0]
+
+
+def test_live_mcp_timeout_outlasts_server_dispatch(monkeypatch):
+    monkeypatch.delenv("MESOSPIM_NETWORK_TIMEOUT_SECONDS", raising=False)
+    assert live_session.network_timeout() > config.DISPATCH_TIMEOUT_SEC
+
+
+def test_mcp_response_ignores_windows_client_abort():
+    handler = srv._make_handler(None, "secret")
+
+    class ClosedSocket:
+        def write(self, _body):
+            raise ConnectionAbortedError(10053, "client closed")
+
+    class Response:
+        wfile = ClosedSocket()
+
+        def send_response(self, _status):
+            pass
+
+        def send_header(self, _name, _value):
+            pass
+
+        def end_headers(self):
+            pass
+
+    handler._json(Response(), 200, {"ok": True})
+
+
+def test_mcp_hostile_tools_call_is_error_not_crash():
+    for params in ({"name": "__class__", "arguments": {}}, {}, {"name": None, "arguments": {}}):
+        status, reply = _jsonrpc(_h.mcp.port, {"jsonrpc": "2.0", "id": 1,
+            "method": "tools/call", "params": params})
+        assert status == 200 and reply["result"]["isError"] is True, params
+    assert _h.core.calls() == []
+    ok, payload = _h.invoke("mcp", "get_state", {})     # the handler survives every hostile call
+    assert ok and isinstance(payload, dict)
+
+
+def test_viability_refused_and_never_actuates():
+    """Folded from test_viability.py: both lanes refuse a get_limits-derived max+1, and the refusal
+    proof never moves the stage."""
+    for lane in ("mcp", "tcp"):
+        limits = _h.invoke(lane, "get_limits", {})[1]["enforced"]["axes"]
+        axis, bound = next((a, r) for a, r in limits.items() if r)
+        _refused(lane, "move_absolute", {"targets": {axis: bound[1] + 1}}, code="validation")
+    assert [c for c in _h.core.calls() if c[0] == "move_absolute"] == []
+
+
+# --- the two confusable corpora (full, all-or-nothing) ---
+
+def test_mcp_origin_corpus_403():
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "move_absolute", "arguments": {"targets": {"x": 0}}}}).encode()
+    hostile = ["null", "http://evil.example", "http://localhost.evil.example",
+               "http://127.0.0.1.evil", "http://127.0.0.1:42100", "http://user@localhost",
+               "HTTP://LOCALHOST", "http://localhost.", "https://localhost@evil.example",
+               "file://localhost"]
+    for origin in hostile:
+        status = _raw(body, auth=f"Bearer {TOKEN}", origin=origin,
+                      extra=[f"Content-Length: {len(body)}"])
+        assert status == 403, (origin, status)
+    assert _h.core.calls() == []
+
+
+def test_mcp_auth_corpus_401():
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "move_absolute", "arguments": {"targets": {"x": 0}}}}).encode()
+    # each sent with a VALID Origin (checked before auth), so the check reaches hmac.compare_digest.
+    candidates = [None, "Bearer ", f"Bearer {TOKEN[:5]}", f"Bearer {TOKEN} ", f"Bearer  {TOKEN}",
+                  f"Bearer {TOKEN.upper()}", f"Bearer {TOKEN}\x00", f"Bearer Bearer {TOKEN}"]
+    for auth in candidates:
+        status = _raw(body, auth=auth, extra=[f"Content-Length: {len(body)}"])
+        assert status == 401, (auth, status)
+    assert _h.core.calls() == []
+
+
+def test_mcp_boundary_smoke():
+    # one 404: wrong path (checked before origin/auth)
+    request = urllib.request.Request(f"http://127.0.0.1:{_h.mcp.port}/nope", data=b"{}",
+        headers={"Origin": "http://127.0.0.1", "Authorization": f"Bearer {TOKEN}"}, method="POST")
     try:
-        passed = 0
-        for name, function in sorted(globals().items()):
-            if name.startswith("test_") and callable(function):
-                function()
-                print(f"ok   {name}")
-                passed += 1
-        print(f"\nALL {passed} BOUNDED TRANSPORT ADVERSARIAL TESTS PASSED")
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as reply:
+            status = reply.status
+    except urllib.error.HTTPError as error:
+        status = error.code
+    assert status == 404
+
+    # one 413: Content-Length over the cap answers before the body is read (send none)
+    assert _raw(b"", auth=f"Bearer {TOKEN}", shutdown_write=True,
+                extra=[f"Content-Length: {config.MAX_MCP_BODY_BYTES + 1}"]) == 413
+
+    # one 400: a duplicate Content-Length is rejected before dispatch
+    assert _raw(b"{}", auth=f"Bearer {TOKEN}",
+                extra=["Content-Length: 2", "Content-Length: 2"]) == 400
+    assert _h.core.calls() == []
+
+
+def test_tcp_framing_and_pipelining():
+    adapter = _h.tcp.adapter
+    # wrong token -> AUTH-FAILED and dropped
+    conn = _h.tcp.new_conn(authed=False)
+    adapter._handle(conn, "not-the-token")
+    assert last_frame(conn) == "AUTH-FAILED"
+    assert conn not in adapter._clients
+
+    # a bad header and an oversized length header both raise before allocating
+    for bad in (b"12x\n", str(config.MAX_FRAME_BYTES + 1).encode("ascii") + b"\n"):
+        decoder = srv.FrameDecoder()
+        decoder.feed(bad + b"payload")
+        with pytest.raises(srv.FramingError):
+            list(decoder.frames())
+
+    # pipelined bad-utf8 + hostile + healthy: first two non-OK, third OK, only healthy reaches Core
+    conn = _h.tcp.new_conn(authed=True)
+    decoder = srv.FrameDecoder()
+    decoder.feed(srv.frame(b'{"move_\xffabsolute":{"targets":{"x":0}}}')
+                 + srv.frame(json.dumps({"__import__": {}}).encode())
+                 + srv.frame(json.dumps({"set_intensity": {"intensity": 20}}).encode()))
+    replies = []
+    for payload in decoder.frames():
+        adapter._handle(conn, payload.decode(config.ENCODING, "replace"))
+        replies.append(last_frame(conn))
+    assert not replies[0].startswith(config.OK_MARKER)
+    assert not replies[1].startswith(config.OK_MARKER)
+    assert replies[2].startswith(config.OK_MARKER)
+    assert [c[0] for c in _h.core.calls()] == ["set_intensity"]
+
+
+def test_mcp_bind_serve_stop():
+    core = RecordingCore()
+    handle = srv.start(core, "MCP", "127.0.0.1", 0, "tok")
+    try:
+        assert handle.port > 0
+        status, reply = _jsonrpc(handle.port, {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+                                 token="tok")
+        assert status == 200
+        assert reply["result"]["serverInfo"]["name"] == config.MCP_SERVER_NAME
     finally:
-        teardown_module()
+        handle.stop()                                   # joins the daemon thread AND closes the socket
+    # stop() calls server.shutdown() then server.server_close(), so the listening socket is released:
+    # a follow-up connect to the same port is REFUSED (URLError). TimeoutError is still accepted to
+    # stay robust to OS timing, but the point is that the server is fully down, not merely paused.
+    with pytest.raises((urllib.error.URLError, TimeoutError)):
+        _jsonrpc(handle.port, {"jsonrpc": "2.0", "id": 2, "method": "initialize"}, token="tok")
+
+
+# --- wire discovery over the real MCP loopback ---
+
+def test_tools_list_over_wire():
+    reply = _h.mcp.rpc("tools/list")
+    tools = reply["result"]["tools"]
+    assert {t["name"] for t in tools} == set(dispatcher.COMMANDS)
+    assert len(tools) == 53
+    for tool in tools:
+        assert tool["inputSchema"] == {"type": "object"}
+        assert tool["description"]
+        assert tool["description"] == dispatcher.COMMANDS[tool["name"]].hint
+
+
+def test_initialize_over_wire():
+    result = _h.mcp.rpc("initialize")["result"]
+    assert result["protocolVersion"] == config.MCP_PROTOCOL_VERSION
+    assert result["capabilities"] == {"tools": {}}
+    assert result["serverInfo"]["name"] == config.MCP_SERVER_NAME
+    assert result["serverInfo"]["version"] == config.MCP_SERVER_VERSION
+    assert "get_manual" in result["instructions"]       # every client is directed to the manual
+
+
+def test_get_manual_over_wire():
+    manuals = {}
+    for lane in ("mcp", "tcp"):
+        ok, payload = _h.invoke(lane, "get_manual", {})
+        assert ok
+        manuals[lane] = payload
+
+        # The command list is generated from the registry, so it cannot drift from implementation.
+        assert {command["name"] for command in payload["commands"]} == set(VALID_CASES)
+        assert "poll get_progress" in payload["interaction"]["kinds"]["wait"]
+        assert "either rejected" in payload["interaction"]["accepted_or_rejected"]
+        assert set(payload["interaction"]["error_codes"]) == {
+            "validation", "busy", "unknown_command", "execution"}
+
+    # TCP and MCP must expose exactly the same built-in reference manual.
+    assert manuals["tcp"] == manuals["mcp"]
+
+
+def test_get_capabilities_over_wire():
+    ok, payload = _h.invoke("mcp", "get_capabilities", {})
+    assert ok
+    assert set(payload["commands"]) == set(VALID_CASES)
+    assert "set_mode" not in payload["commands"] and "procedure" not in payload["commands"]
+
+
+def test_unknown_state_key_is_validation_over_mcp():
+    """A client-supplied unknown state key is rejected during validation."""
+    status, reply = _jsonrpc(_h.mcp.port, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "get_state_all", "arguments": {"keys": ["does_not_exist"]}}})
+    assert status == 200
+    result = reply["result"]
+    assert result["isError"] is True
+    assert json.loads(result["content"][0]["text"])["error"]["code"] == "validation"
+
+
+def test_corpus_is_bounded():
+    assert REQUEST_TIMEOUT <= 0.6
+    assert config.MAX_MCP_BODY_BYTES <= 1 << 20

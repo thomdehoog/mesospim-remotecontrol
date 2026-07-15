@@ -1,4 +1,4 @@
 * text=auto eol=lf
 
 # Never touch the patch: CRLF conversion breaks `git apply` against LF sources.
-*.patch -text
+*.patch -text -whitespace

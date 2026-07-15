@@ -13,6 +13,7 @@ import urllib.parse
 import pytest
 
 from tests.support.clients import RemoteControl, mcp_call
+from tests.support.live_session import network_timeout
 
 
 pytestmark = pytest.mark.live_valid
@@ -44,7 +45,7 @@ def _mcp_config():
     token = os.environ.get("MESOSPIM_LIVE_MCP_TOKEN")
     if not token:
         pytest.skip("set MESOSPIM_LIVE_MCP_TOKEN for the live MCP server")
-    return parsed.hostname, parsed.port, token, delta, hold
+    return parsed.hostname, parsed.port, token, delta, hold, network_timeout()
 
 
 def _tcp_config():
@@ -59,12 +60,33 @@ def _tcp_config():
     return host, port, token, delta, hold
 
 
-def _mcp_tool(host, port, token, name, arguments=None):
-    reply = mcp_call(host, port, token, "tools/call", name, arguments or {})
+def _mcp_tool(host, port, token, request_timeout, name, arguments=None):
+    reply = mcp_call(
+        host, port, token, "tools/call", name, arguments or {}, timeout=request_timeout
+    )
     result = reply["result"]
     if result.get("isError"):
         raise RuntimeError(result["content"][0]["text"])
     return json.loads(result["content"][0]["text"])
+
+
+def _wait_for_move(tool, result, label):
+    """Poll the accepted operation ID; never repeat a move after an uncertain response."""
+    operation = result["operation"]
+    operation_id = operation["id"]
+    timeout = float(os.environ.get("MESOSPIM_OPERATION_TIMEOUT_SECONDS", "120"))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        current = tool("get_progress")["operation"]
+        assert current.get("id") == operation_id, (
+            f"{label} operation changed from {operation_id} to {current.get('id')}"
+        )
+        if current.get("status") == "completed":
+            return current
+        if current.get("status") == "failed":
+            raise AssertionError(f"{label} failed: {current}")
+        time.sleep(0.05)
+    raise AssertionError(f"timed out after {timeout:g}s waiting for {label} {operation_id}")
 
 
 def _exercise_x_change(tool, transport, requested_delta, hold):
@@ -84,19 +106,23 @@ def _exercise_x_change(tool, transport, requested_delta, hold):
 
     changed = None
     try:
-        tool("move_absolute", {"targets": {"x": target}})
+        accepted = tool("move_absolute", {"targets": {"x": target}})
+        assert accepted["operation"]["status"] in {"processing", "completed"}
+        _wait_for_move(tool, accepted, "absolute X move")
         changed = tool("get_position")
         assert changed["x"] == target
         if hold:
             time.sleep(hold)
 
-        tool("move_relative", {"deltas": {"x": -delta}})
+        accepted = tool("move_relative", {"deltas": {"x": -delta}})
+        _wait_for_move(tool, accepted, "relative X restoration")
         restored = tool("get_position")
         assert restored["x"] == before["x"]
     finally:
         current = tool("get_position")
         if current["x"] != before["x"]:
-            tool("move_absolute", {"targets": {"x": before["x"]}})
+            accepted = tool("move_absolute", {"targets": {"x": before["x"]}})
+            _wait_for_move(tool, accepted, "absolute X cleanup")
 
     print(
         f"live {transport} X changed {before['x']} -> {changed['x']} -> {before['x']} "
@@ -106,9 +132,11 @@ def _exercise_x_change(tool, transport, requested_delta, hold):
 
 def test_live_mcp_x_move_changes_position_and_restores_it():
     """Run the valid movement contract through MCP."""
-    host, port, token, delta, hold = _mcp_config()
+    host, port, token, delta, hold, request_timeout = _mcp_config()
     _exercise_x_change(
-        lambda name, arguments=None: _mcp_tool(host, port, token, name, arguments),
+        lambda name, arguments=None: _mcp_tool(
+            host, port, token, request_timeout, name, arguments
+        ),
         "MCP", delta, hold,
     )
 

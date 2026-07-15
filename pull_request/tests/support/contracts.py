@@ -10,6 +10,7 @@ VALID_CASES = {
     "get_info": {},
     "get_limits": {},
     "get_capabilities": {},
+    "get_manual": {},
     "get_progress": {},
     "self_test": {},
     "move_absolute": {"targets": {"x": 100}},
@@ -18,13 +19,14 @@ VALID_CASES = {
     "unzero": {"axes": ["x"]},
     "stop": {},
     "stop_activity": {},
+    "clear_stuck_operation": {},
     "set_state": {"settings": {"intensity": 25}},
     "set_filter": {"filter": "Empty", "wait": True},
     "set_zoom": {"zoom": "1x", "wait": True, "update_etl": False},
     "set_laser": {"laser": "488 nm", "wait": True, "update_etl": False},
     "set_intensity": {"intensity": 25, "wait": True},
     "set_shutterconfig": {"shutterconfig": "Left"},
-    "set_camera": {"camera_exposure_time": 0.01},
+    "set_camera": {"camera_exposure_time": 0.02},
     "set_etl": {"etl_l_amplitude": 1.0},
     "set_galvo": {"galvo_l_frequency": 100.0},
     "set_laser_timing": {"laser_l_delay_%": 10.0},
@@ -33,19 +35,17 @@ VALID_CASES = {
     "update_etl_from_zoom": {"zoom": "1x", "wait": True},
     "open_shutters": {},
     "close_shutters": {},
-    "snap": {},
-    "get_snap_image": {"offset": 0, "max_bytes": 4},
-    "set_mode": {"mode": "idle"},
     "start_live": {},
     "start_visual_mode": {},
     "start_lightsheet_alignment_mode": {},
     "load_sample": {},
     "unload_sample": {},
     "center_sample": {},
-    "execute_stage_program": {},
     "save_etl_config": {},
     "get_acquisition_list": {},
-    "set_acquisition_list": {"acquisitions": [], "selected_row": 0},
+    "set_acquisition_list": {"acquisitions": [{
+        "z_start": 0, "z_end": 0, "z_step": 1, "planes": 1,
+    }], "selected_row": 0},
     "run_acquisition_list": {},
     "run_selected_acquisition": {"row": 0},
     "preview_acquisition": {"row": 0, "z_update": True},
@@ -53,6 +53,9 @@ VALID_CASES = {
         "acquisition": {
             "folder": "tmp",
             "filename": "valid.tif",
+            "z_start": 0,
+            "z_end": 0,
+            "z_step": 1,
             "planes": 1,
             "laser": "488 nm",
             "intensity": 10,
@@ -90,14 +93,12 @@ EXPECTED_CORE_CALL = {
     "update_etl_from_zoom": "sig_state_request_and_wait_until_done",
     "open_shutters": "open_shutters",
     "close_shutters": "close_shutters",
-    "snap": "snap",
     "start_live": "set_state",
     "start_visual_mode": "set_state",
     "start_lightsheet_alignment_mode": "set_state",
     "load_sample": "move_absolute",
     "unload_sample": "move_absolute",
     "center_sample": "move_absolute",
-    "execute_stage_program": "execute_galil_program",
     "save_etl_config": "sig_save_etl_config",
     "run_acquisition_list": "start",
     "run_selected_acquisition": "start",
@@ -119,20 +120,24 @@ READ_ONLY_WITHOUT_CORE_CALL = {
     "get_info",
     "get_limits",
     "get_capabilities",
+    "get_manual",
     "get_progress",
-    "get_snap_image",
     "self_test",
     "get_acquisition_list",
     "stat_files",
     "stop_activity",
-    "set_mode",
+    "clear_stuck_operation",   # EMERGENCY, makes no Core call (frees the gate only if core is idle)
 }
 
 OPERATIONAL_COMMANDS = set(EXPECTED_CORE_CALL) | {
     "set_acquisition_list",
-    "set_mode",
     "stop_activity",
 }
 
-assert len(VALID_CASES) == 55
-assert len(OPERATIONAL_COMMANDS) == 40
+assert len(VALID_CASES) == 53
+assert len(OPERATIONAL_COMMANDS) == 37
+
+# A universal negative case for every exact command name. Command-specific wrong types, unsafe
+# values, malformed envelopes, boundary breaches and races live in the adversarial suites; this
+# table proves that no command silently accepts misspelled/extra fields.
+UNEXPECTED_ARGUMENT_CASES = {name: {"__unexpected__": True} for name in VALID_CASES}

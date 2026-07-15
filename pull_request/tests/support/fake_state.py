@@ -26,7 +26,6 @@ DEFAULTS = {
     "shutterconfig": "Both",
     "shutterstate": False,
     "folder": "",
-    "snap_folder": "",
     "ETL_cfg_file": "",
     "etl_l_delay_%": 7.5,
     "etl_l_ramp_rising_%": 85,
