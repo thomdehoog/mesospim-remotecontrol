@@ -1,0 +1,2684 @@
+From 9da8ac827ddd65f94dbf574732027fd0aa58ac9d Mon Sep 17 00:00:00 2001
+From: Thom de Hoog <thomdehoog@gmail.com>
+Date: Tue, 14 Jul 2026 18:17:40 +0200
+Subject: [PATCH] Add optional Remote Control tab: TCP + MCP named-call server
+
+Add a validated named-call control surface shared by framed TCP and MCP-over-HTTP.
+Commands are allowlisted, strictly parsed, checked against live configuration limits
+and fixed state-machine modes, and protected by a shared operation gate that rejects
+competing mutations until real completion.
+
+The integration is off by default. MainWindow gains four lines and Core a declared
+session plus two delegating slots; protocol, validation, busy gating, the GUI tab, the
+transports and the clients that call them live in three self-contained modules.
+---
+ mesoSPIM/src/mesoSPIM_Core.py                 |   44 +-
+ mesoSPIM/src/mesoSPIM_MainWindow.py           |    4 +
+ .../src/mesoSPIM_RemoteControl_Servers.py     |  575 +++++++
+ mesoSPIM/src/mesoSPIM_RemoteControl_Tab.py    |  222 +++
+ ...IM_RemoteControl_ValidateAndRunCommands.py | 1401 +++++++++++++++++
+ .../src/test_remote_control_validation.py     |  320 ++++
+ pyproject.toml                                |    1 +
+ 7 files changed, 2565 insertions(+), 2 deletions(-)
+ create mode 100644 mesoSPIM/src/mesoSPIM_RemoteControl_Servers.py
+ create mode 100644 mesoSPIM/src/mesoSPIM_RemoteControl_Tab.py
+ create mode 100644 mesoSPIM/src/mesoSPIM_RemoteControl_ValidateAndRunCommands.py
+ create mode 100644 mesoSPIM/src/test_remote_control_validation.py
+
+diff --git a/mesoSPIM/src/mesoSPIM_Core.py b/mesoSPIM/src/mesoSPIM_Core.py
+index cb159e4..8d6a0ac 100644
+--- a/mesoSPIM/src/mesoSPIM_Core.py
++++ b/mesoSPIM/src/mesoSPIM_Core.py
+@@ -84,6 +84,9 @@ class mesoSPIM_Core(QtCore.QObject):
+     ''' ETL-related signals '''
+     sig_save_etl_config = QtCore.pyqtSignal()
+ 
++    ''' Remote-control signals '''
++    sig_remote_control_started = QtCore.pyqtSignal(bool, str) # (ok, 'host:port' or the failure reason)
++
+     def __init__(self, config, parent):
+         super().__init__()
+ 
+@@ -96,7 +99,10 @@ class mesoSPIM_Core(QtCore.QObject):
+         self.state['state'] = 'init'
+ 
+         self.frame_queue = deque([])
+-        self.frame_queue_display = deque([], maxlen=1)    
++        self.frame_queue_display = deque([], maxlen=1)
++
++        self._remote_session = {"operation": None, "counter": 0, "snapshot": None} # why it is eager, and Core's: _session() in mesoSPIM_RemoteControl_ValidateAndRunCommands.py
++        self._remote_control_server = None
+ 
+         ''' The signal-slot switchboard '''
+         # Note the name duplication (shadowing)!!
+@@ -1178,6 +1184,40 @@ class mesoSPIM_Core(QtCore.QObject):
+         self.state['state']='idle'
+         self.sig_update_gui_from_state.emit()
+ 
++    @QtCore.pyqtSlot(str, int, str)
++    def start_remote_control(self, host, port, token):
++        '''Start the TCP remote-control server.
++
++        Called via a queued connection, so this runs on the Core's own thread -- the same
++        thread execute_script runs on, which is where the server needs to live. The server
++        runs its own fail-closed self-test before it binds, so a failure here means the
++        instrument was never exposed; sig_remote_control_started carries the reason to the
++        tab, which must not show "running" after a failed bind (e.g. the port is in use).
++        '''
++        from .mesoSPIM_RemoteControl_Servers import RemoteControlTCPServer
++        self.stop_remote_control()  # restart-safe: never leave two servers running at once
++        try:
++            self._remote_control_server = RemoteControlTCPServer(self, host, int(port), token or None)
++        except Exception as exc:
++            logger.exception('Remote-control server failed to start')
++            self.sig_remote_control_started.emit(False, str(exc))
++            return
++        actual_port = self._remote_control_server.port # port 0 asked Qt to allocate a real one
++        logger.info(f'Remote-control TCP server on {host}:{actual_port} (token {"set" if token else "off"})')
++        self.sig_remote_control_started.emit(True, f'{host}:{actual_port}')
++
++    @QtCore.pyqtSlot()
++    def stop_remote_control(self):
++        '''Stop the remote-control server, if one is running (safe to call anytime).
++
++        The server drops its clients and disconnects its completion signals, but the session
++        it was reading stays on the Core: a Stop/Start must not erase the busy gate, the
++        operation counter, the snapshot, or a saved acquisition list.
++        '''
++        if self._remote_control_server is not None:
++            self._remote_control_server.stop()
++            self._remote_control_server = None
++
+     def lightsheet_alignment_mode(self):
+         """Continuous live mode that alternates left/right shutters for dual-lightsheet co-alignment.
+ 
+@@ -1340,4 +1380,4 @@ class mesoSPIM_Core(QtCore.QObject):
+         self.timelapse_waiting_for_finish = False
+         self.time_counter = 0
+         if was_active:
+-            self.sig_time_lapse_cancelled.emit()
+\ No newline at end of file
++            self.sig_time_lapse_cancelled.emit()
+diff --git a/mesoSPIM/src/mesoSPIM_MainWindow.py b/mesoSPIM/src/mesoSPIM_MainWindow.py
+index da5de00..9d7fdb8 100644
+--- a/mesoSPIM/src/mesoSPIM_MainWindow.py
++++ b/mesoSPIM/src/mesoSPIM_MainWindow.py
+@@ -24,6 +24,7 @@ from .mesoSPIM_ScriptWindow import mesoSPIM_ScriptWindow # do not delete this li
+ from .mesoSPIM_TileViewWindow import mesoSPIM_TileViewWindow
+ from .mesoSPIM_State import mesoSPIM_StateSingleton
+ from .mesoSPIM_Core import mesoSPIM_Core
++from .mesoSPIM_RemoteControl_Tab import RemoteControlTab
+ from .devices.joysticks.mesoSPIM_JoystickHandlers import mesoSPIM_JoystickHandler
+ from .utils.utility_functions import log_cpu_core, fit_window_to_screen, move_window_into_screen, convert_seconds_to_string
+ 
+@@ -274,6 +275,7 @@ class mesoSPIM_MainWindow(QtWidgets.QMainWindow):
+     def close_app(self):
+         #self.log_display_handler.flushOnClose = False #discontinued
+         logger.info('Closing the application')
++        self.remote_control.shutdown()
+         self.camera_window.close()
+         self.acquisition_manager_window.close()
+         if self.optimizer:
+@@ -608,6 +610,8 @@ class mesoSPIM_MainWindow(QtWidgets.QMainWindow):
+ 
+         self.checkBoxScaleWZoom.stateChanged.connect(self.scale_galvo_amp_w_zoom)
+ 
++        self.remote_control = RemoteControlTab(self)
++
+         ''' Timelapse tab '''
+         self.AsFastAsPossibleCheckBox.toggled.connect(self.toggle_timelapse_interval)
+         self.toggle_timelapse_interval(self.AsFastAsPossibleCheckBox.isChecked())  # sync initial state set in the .ui file
+diff --git a/mesoSPIM/src/mesoSPIM_RemoteControl_Servers.py b/mesoSPIM/src/mesoSPIM_RemoteControl_Servers.py
+new file mode 100644
+index 0000000..3aeabb3
+--- /dev/null
++++ b/mesoSPIM/src/mesoSPIM_RemoteControl_Servers.py
+@@ -0,0 +1,575 @@
++"""Remote-control TCP and MCP servers for mesoSPIM, and the clients that call them.
++
++The TCP server runs inside mesoSPIM-control and executes validated JSON commands. The MCP
++server is a small standalone HTTP server that forwards MCP tool calls to that same TCP
++server, so both protocols share one command path.
++
++The clients live here too, next to the servers that speak to them, so the wire format is
++written exactly once:
++
++    from mesoSPIM.src.mesoSPIM_RemoteControl_Servers import RemoteControl, mcp_call
++
++    scope = RemoteControl(port=42000, token="...")
++    scope.call("move_absolute", targets={"x": 100})
++
++Everything at module level here is standard library, so a script can import the clients
++without pulling in Qt or any hardware driver.
++
++Run as a script, this starts the MCP bridge. That is how the GUI launches it.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hmac
++import json
++import logging
++import socket
++import sys
++import urllib.request
++from functools import partial
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++if __package__ in (None, ""):
++    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
++    from mesoSPIM.src.mesoSPIM_RemoteControl_ValidateAndRunCommands import (
++        capture_snap_image, complete_operation, parse_call, run, self_test,
++        strict_json_loads, tool_specs,
++    )
++else:
++    from .mesoSPIM_RemoteControl_ValidateAndRunCommands import (
++        capture_snap_image, complete_operation, parse_call, run, self_test,
++        strict_json_loads, tool_specs,
++    )
++
++logger = logging.getLogger(__name__)
++
++ENCODING = "utf-8"
++OK_MARKER = "__MESOSPIM_OK__"
++MAX_FRAME_BYTES = 1 << 20
++MAX_FRAME_HEADER_BYTES = 16
++MAX_MCP_BODY_BYTES = 1 << 20
++
++
++class FramingError(ValueError):
++    pass
++
++
++def frame(payload):
++    """Return the simple '<byte-count>\\n<payload>' frame used by TCP clients."""
++    if isinstance(payload, str):
++        payload = payload.encode(ENCODING)
++    if len(payload) > MAX_FRAME_BYTES:
++        raise FramingError(f"payload exceeds {MAX_FRAME_BYTES} bytes")
++    return str(len(payload)).encode("ascii") + b"\n" + payload
++
++
++def frame_length(head):
++    """The payload length a frame header promises, refusing anything non-canonical.
++
++    Canonical means ASCII digits and nothing else: no sign, no padding, no whitespace, so
++    "+1" and "1 0" are refused rather than quietly coerced. Both framing implementations
++    below call this, because two copies of a security check are two chances for one of them
++    to be the laxer. The size cap is enforced here, on the header alone, so an oversized
++    frame is refused before a byte of its payload is read or buffered.
++    """
++    if not head or len(head) > MAX_FRAME_HEADER_BYTES or not head.isdigit():
++        raise FramingError("expected canonical byte-count header")
++    length = int(head)
++    if length > MAX_FRAME_BYTES:
++        raise FramingError(f"frame exceeds {MAX_FRAME_BYTES} bytes")
++    return length
++
++
++class FrameReader:
++    """Reads length-framed replies from a socket it owns, blocking until each is complete.
++
++    It keeps any bytes that belong to the NEXT frame, so a client whose replies arrive
++    coalesced does not silently lose one. This is the blocking counterpart of FrameDecoder,
++    which can never block because it runs on Qt's event loop; both call frame_length, so the
++    header rules cannot drift apart.
++    """
++
++    def __init__(self, sock):
++        self._sock = sock
++        self._buf = b""
++
++    def read(self):
++        while b"\n" not in self._buf:
++            if len(self._buf) > MAX_FRAME_HEADER_BYTES:
++                raise FramingError("frame header is too long")
++            self._buf += self._recv()
++        head, _, rest = self._buf.partition(b"\n")
++        length = frame_length(head)
++        while len(rest) < length:
++            rest += self._recv()
++        self._buf = rest[length:]
++        return rest[:length].decode(ENCODING, "replace")
++
++    def _recv(self):
++        chunk = self._sock.recv(4096)
++        if not chunk:
++            raise ConnectionError("TCP server closed the connection")
++        return chunk
++
++
++def read_frame(sock):
++    """One frame from a socket carrying nothing after it: one-shot callers and tests."""
++    return FrameReader(sock).read()
++
++
++def handle_tcp_message(core, payload):
++    try:
++        call, args = parse_call(payload)
++        return OK_MARKER + json.dumps(run(core, call, args))
++    except Exception as exc:
++        return f"error: {exc}"
++
++
++class FrameDecoder:
++    """Incremental decoder for TCP frames arriving from Qt sockets.
++
++    The non-blocking counterpart of read_frame: Qt hands us whatever bytes have arrived, so a
++    frame can be split across readyRead signals and several frames can arrive in one. It
++    therefore keeps a buffer and yields only complete frames, returning quietly when it needs
++    more -- it must never wait on the socket, because it runs on the Core's event loop.
++    """
++
++    def __init__(self):
++        self._buf = b""
++
++    def feed(self, data):
++        self._buf += bytes(data)
++
++    def frames(self):
++        while True:
++            if b"\n" not in self._buf:
++                if len(self._buf) > MAX_FRAME_HEADER_BYTES:
++                    raise FramingError("frame header is too long")
++                return
++            head, _, rest = self._buf.partition(b"\n")
++            length = frame_length(head)
++            if len(rest) < length:
++                return
++            self._buf = rest[length:]
++            yield rest[:length]
++
++
++class AuthGate:
++    """One-token gate; after a correct token, later frames are commands."""
++
++    def __init__(self, token=None):
++        self._token = token or None
++        self.passed = self._token is None
++
++    def check(self, supplied):
++        if isinstance(supplied, str):
++            supplied = supplied.encode(ENCODING)
++        ok = hmac.compare_digest(supplied, str(self._token).encode(ENCODING))
++        if ok:
++            self.passed = True
++        return ok
++
++
++class RemoteControlTCPServer:
++    """Single-client framed JSON TCP server hosted by mesoSPIM Core.
++
++    A plain Python object, deliberately not a QObject. That keeps the completion signals as
++    direct connections, which is the live-validated behaviour -- and it means _on_camera_frame
++    runs ON THE CAMERA THREAD while command dispatch mutates the same Core-owned session from
++    the Core thread. Two known consequences, neither of them fixable inside a cleanup:
++
++    - Cross-thread session access. capture_snap_image writes the snapshot from the camera
++      thread; dispatch writes the operation from the Core thread. Preserved as-is.
++    - A snap whose camera frame never arrives wedges the busy gate. The operation stays active
++      on milestone "snap_image"; stop only moves it to "stopping", which is still active, and
++      sig_finished cannot close a "snap_image" milestone. Every mutating command then raises
++      BusyError until mesoSPIM restarts. Server Stop/Start is NOT a recovery path: it
++      deliberately preserves the Core-owned session, precisely so a GUI click cannot clear a
++      busy gate while the instrument is running. Operation-ID matching would not fix this
++      either -- it prevents a stale callback completing a NEWER operation, and says nothing
++      about a completion signal that never arrives. Real recovery needs a timeout, a
++      cancel-on-stop transition, or a recovery command. All are out of scope here.
++    """
++
++    def __init__(self, core, host="127.0.0.1", port=42000, token=None):
++        """Smoke-check the limits, then bind. Fail-closed, and in that order.
++
++        The smoke-check runs FIRST, before Qt is even imported or a socket opened: it drives a
++        mock Core carrying THIS instrument's real cfg and checks the loaded limits still refuse
++        an out-of-range call. If they do not -- a drifted limits file, a validation quirk --
++        this raises, the server never binds, and Core reports the failure to the tab. The
++        hardware is never exposed. It covers both lanes, because MCP forwards to this server
++        and every call runs the same validated dispatch.
++        """
++        ok, report = self_test(getattr(core, "cfg", None))
++        if not ok:
++            failed = [line for line in report if line.startswith("FAIL")]
++            raise RuntimeError("remote-control self-test failed; not going live: " + "; ".join(failed))
++
++        from PyQt5 import QtNetwork
++
++        self.core = core
++        self._token = token or None
++        self._server = QtNetwork.QTcpServer(core)
++        if not self._server.listen(QtNetwork.QHostAddress(host), int(port)):
++            raise RuntimeError(f"cannot listen on {host}:{port}: {self._server.errorString()}")
++        self._host = host
++        self._port = int(self._server.serverPort())
++        self._server.newConnection.connect(self._on_new_connection)
++        self._clients = {}
++        self._connections = [
++            (getattr(core, "sig_finished", None), self._on_core_finished),
++            (getattr(core, "sig_time_lapse_finished", None), self._on_time_lapse_finished),
++            (getattr(core, "sig_time_lapse_cancelled", None), self._on_time_lapse_finished),
++            (getattr(getattr(core, "camera_worker", None), "sig_camera_frame", None),
++             self._on_camera_frame),
++        ]
++        for signal, slot in self._connections:
++            if signal is not None:
++                signal.connect(slot)
++        logger.info("Remote control TCP listening on %s:%d", self._host, self._port)
++
++    @property
++    def port(self):
++        return self._port
++
++    def _on_new_connection(self):
++        """Accept each pending client, then read what it may already have sent.
++
++        A fast local client can deliver its first frame before readyRead is connected, and Qt
++        does not replay an already-emitted signal. Without the explicit drain, that first frame
++        would sit in the socket buffer until more bytes arrived -- and the MCP bridge, which
++        sends its token and then waits, would hang instead of authenticating.
++        """
++        while self._server.hasPendingConnections():
++            conn = self._server.nextPendingConnection()
++            self._clients[conn] = {
++                "decoder": FrameDecoder(),
++                "auth": AuthGate(self._token),
++            }
++            conn.readyRead.connect(partial(self._on_ready_read, conn))
++            conn.disconnected.connect(partial(self._on_disconnected, conn))
++            if conn.bytesAvailable():
++                self._on_ready_read(conn)
++
++    def _on_disconnected(self, conn):
++        self._clients.pop(conn, None)
++        try:
++            conn.deleteLater()
++        except RuntimeError:
++            pass
++
++    def _drop_client(self, conn):
++        self._clients.pop(conn, None)
++        try:
++            conn.disconnected.disconnect()
++        except (TypeError, RuntimeError):
++            pass
++        try:
++            conn.disconnectFromHost()
++            conn.deleteLater()
++        except RuntimeError:
++            pass
++
++    def _on_ready_read(self, conn):
++        """Drain everything that has arrived, not just the first frame.
++
++        readyRead is not recursive: Qt will not re-enter this slot while it is running. An
++        authenticated loopback client can send its command while we are still writing "OK", so
++        bytes that arrive during this call would sit unread until the NEXT readyRead -- which
++        may never come, because the client is waiting for our reply. Hence the drain loop, and
++        hence the re-check of conn after each frame: a handler may have dropped the client.
++        """
++        client = self._clients.get(conn)
++        if client is None:
++            return
++        try:
++            while conn in self._clients and conn.bytesAvailable():
++                client["decoder"].feed(bytes(conn.readAll()))
++                for payload in client["decoder"].frames():
++                    self._handle(conn, payload.decode(ENCODING, "replace"))
++                    if conn not in self._clients:
++                        return
++        except FramingError as exc:
++            self._send(conn, f"framing error: {exc}")
++            self._drop_client(conn)
++
++    def _send(self, conn, text):
++        if conn in self._clients:
++            conn.write(frame(text))
++            conn.flush()
++
++    def _handle(self, conn, message):
++        client = self._clients.get(conn)
++        if client is None:
++            return
++        auth = client["auth"]
++        if not auth.passed:
++            if auth.check(message):
++                self._send(conn, "OK")
++            else:
++                self._send(conn, "AUTH-FAILED")
++                self._drop_client(conn)
++            return
++        self._send(conn, handle_tcp_message(self.core, message))
++
++    def _on_core_finished(self):
++        complete_operation(self.core, "finished")
++
++    def _on_camera_frame(self):
++        """Runs ON THE CAMERA THREAD -- this is a direct connection. See the class docstring."""
++        capture_snap_image(self.core)
++
++    def _on_time_lapse_finished(self):
++        """Complete the remote time-lapse operation, normalizing Core's stale state readback.
++
++        Core's time-lapse scheduler can leave its public state at run_acquisition_list after
++        the final time point. The remote adapter owns the remote completion contract, so the
++        readback is normalized here rather than by changing mesoSPIM Core or MainWindow.
++        """
++        try:
++            self.core.state["state"] = "idle"
++        except (AttributeError, KeyError, TypeError):
++            pass
++        complete_operation(self.core, "time_lapse")
++
++    def stop(self):
++        """Drop the clients, disconnect the completion signals, close the listener.
++
++        The disconnect walks the same _connections list the connect did, so the two can no
++        longer drift apart: a signal added to one and forgotten in the other would leave this
++        object alive, listening to a Core it no longer serves. The Core-owned session is
++        deliberately left alone -- see the class docstring.
++        """
++        for conn in list(self._clients):
++            self._drop_client(conn)
++        for signal, slot in self._connections:
++            if signal is not None:
++                try:
++                    signal.disconnect(slot)
++                except (TypeError, RuntimeError):
++                    pass
++        self._server.close()
++        logger.info("Remote control TCP stopped")
++
++
++class RemoteControl:
++    """The TCP client: connect once, authenticate once, then make named calls.
++
++    The MCP bridge, the test suite and any operator script all drive the microscope through
++    this one class, so the wire format is implemented once rather than mirrored in a separate
++    example file where it could silently drift from the server that speaks it.
++
++    The error contract is the protocol's, not Python's: a reply that does not carry the OK
++    marker IS the error text, so it is raised verbatim rather than reshaped.
++    """
++
++    def __init__(self, host="127.0.0.1", port=42000, token=None, timeout=10.0):
++        self._sock = socket.create_connection((host, port), timeout=timeout)
++        self._sock.settimeout(timeout)
++        self._reader = FrameReader(self._sock)
++        if token:
++            self._sock.sendall(frame(token))
++            reply = self._reader.read().strip()
++            if reply != "OK":
++                self.close()
++                raise RuntimeError(f"TCP authentication failed: {reply}")
++
++    def call(self, name, **arguments):
++        """Send ``{name: arguments}`` and return the decoded result."""
++        self._sock.sendall(frame(json.dumps({name: arguments})))
++        reply = self._reader.read()
++        if not reply.startswith(OK_MARKER):
++            raise RuntimeError(reply.strip())
++        return json.loads(reply[len(OK_MARKER):])
++
++    def close(self):
++        self._sock.close()
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *_exc):
++        self.close()
++
++
++def mcp_call(host, port, token, method, name=None, arguments=None, timeout=10.0):
++    """The MCP client: POST one JSON-RPC message and return the decoded reply.
++
++    The Origin header is sent because the server refuses anything but a loopback origin;
++    the Bearer token guards the public MCP endpoint.
++    """
++    params = {"name": name, "arguments": arguments or {}} if name else {}
++    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(ENCODING)
++    headers = {"Content-Type": "application/json", "Origin": "http://127.0.0.1"}
++    if token:
++        headers["Authorization"] = f"Bearer {token}"
++    request = urllib.request.Request(
++        f"http://{host}:{port}/mcp", data=body, headers=headers, method="POST")
++    with urllib.request.urlopen(request, timeout=timeout) as reply:
++        return json.loads(reply.read().decode(ENCODING))
++
++
++def tcp_call(host, port, token, name, arguments, timeout):
++    """One named call on its own connection: what the MCP bridge makes per tools/call."""
++    with RemoteControl(host, port, token, timeout=timeout) as scope:
++        return scope.call(name, **(arguments or {}))
++
++
++def json_response(handler, status, payload):
++    body = json.dumps(payload).encode(ENCODING)
++    handler.send_response(status)
++    handler.send_header("Content-Type", "application/json")
++    handler.send_header("Content-Length", str(len(body)))
++    handler.end_headers()
++    handler.wfile.write(body)
++
++
++def allowed_origin(origin):
++    return origin in {
++        "http://127.0.0.1", "http://localhost",
++        "https://127.0.0.1", "https://localhost",
++    }
++
++
++def make_mcp_handler(config):
++    class MCPHandler(BaseHTTPRequestHandler):
++        server_version = "mesoSPIM-MCP/1.0"
++
++        def log_message(self, fmt, *args):
++            if not config.quiet:
++                super().log_message(fmt, *args)
++
++        def do_POST(self):
++            if self.path != "/mcp":
++                return json_response(self, 404, {"error": "not found"})
++            origins = self.headers.get_all("Origin", [])
++            if len(origins) > 1:
++                return json_response(self, 403, {"error": "multiple Origin headers"})
++            origin = origins[0] if origins else ""
++            if origin and not allowed_origin(origin):
++                return json_response(self, 403, {"error": "origin not allowed"})
++            authorizations = self.headers.get_all("Authorization", [])
++            if len(authorizations) != 1:
++                return json_response(self, 401, {"error": "unauthorized"})
++            auth = authorizations[0]
++            supplied = auth[7:] if auth.lower().startswith("bearer ") else ""
++            if not hmac.compare_digest(supplied, config.token):
++                return json_response(self, 401, {"error": "unauthorized"})
++            try:
++                transfer_encodings = self.headers.get_all("Transfer-Encoding", [])
++                if transfer_encodings:
++                    return json_response(
++                        self, 400, {"error": "Transfer-Encoding is unsupported"})
++                lengths = self.headers.get_all("Content-Length", [])
++                if len(lengths) != 1 or not lengths[0].isdigit():
++                    return json_response(self, 400, {"error": "invalid Content-Length"})
++                length = int(lengths[0])
++                if length > MAX_MCP_BODY_BYTES:
++                    return json_response(self, 413, {"error": "request body too large"})
++                body = self.rfile.read(length)
++                if len(body) != length:
++                    return json_response(self, 400, {"error": "truncated request body"})
++                msg = strict_json_loads(body.decode(ENCODING))
++            except (UnicodeError, ValueError):
++                return json_response(self, 400, {"error": "invalid JSON"})
++            reply = mcp_reply(config, msg) if isinstance(msg, dict) else None
++            if reply is None:
++                self.send_response(202)
++                self.send_header("Content-Length", "0")
++                self.end_headers()
++                return
++            json_response(self, 200, reply)
++
++    return MCPHandler
++
++
++def mcp_reply(config, msg):
++    rid = msg.get("id")
++    if rid is None:
++        return None
++    method = msg.get("method")
++    if method == "initialize":
++        result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
++                  "serverInfo": {"name": "mesoSPIM MCP server", "version": "1.0"}}
++    elif method == "tools/list":
++        result = {"tools": tool_specs()}
++    elif method == "tools/call":
++        params = msg.get("params") or {}
++        try:
++            data = tcp_call(
++                config.mesospim_host, config.mesospim_port, config.mesospim_token,
++                params.get("name"), params.get("arguments") or {}, config.timeout,
++            )
++            text, is_error = json.dumps(data), False
++        except Exception as exc:
++            text, is_error = json.dumps({"error": str(exc)}), True
++        result = {"content": [{"type": "text", "text": text}], "isError": is_error}
++    else:
++        return {"jsonrpc": "2.0", "id": rid,
++                "error": {"code": -32601, "message": f"method not found: {method}"}}
++    return {"jsonrpc": "2.0", "id": rid, "result": result}
++
++
++def start_mcp_server_process(parent, package_directory, host, port, token, tcp_token, tcp_port):
++    """Start this file as the standalone MCP server used by the GUI.
++
++    Launched by absolute path, not with -m: the child would then depend on inheriting a
++    working directory, and the failure mode of that assumption is "the MCP lane silently does
++    not start". The path is derived from the package directory the GUI already knows, and the
++    sys.path shim at the top of this file is what lets the child re-import the command module
++    when it runs with no package. The QProcess is parented to the caller, so whoever started
++    it reaps it.
++    """
++    from PyQt5 import QtCore
++
++    script = str(Path(package_directory) / "src" / "mesoSPIM_RemoteControl_Servers.py")
++    proc = QtCore.QProcess(parent)
++    proc.start(sys.executable, [
++        script,
++        "--host", host,
++        "--port", str(port),
++        "--token", token,
++        "--mesospim-host", "127.0.0.1",
++        "--mesospim-port", str(tcp_port),
++        "--mesospim-token", tcp_token,
++    ])
++    if not proc.waitForStarted(3000):
++        return False, proc.errorString(), None
++    QtCore.QThread.msleep(300)
++    if proc.state() == QtCore.QProcess.NotRunning:
++        stderr = bytes(proc.readAllStandardError()).decode(ENCODING, "replace").strip()
++        return False, stderr or "MCP server exited during startup", None
++    return True, f"{host}:{port}", proc
++
++
++def stop_mcp_server_process(proc):
++    """Stop a QProcess returned by start_mcp_server_process."""
++    if proc is None:
++        return
++    proc.terminate()
++    if not proc.waitForFinished(2000):
++        proc.kill()
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description="Expose mesoSPIM Remote Control as MCP.")
++    parser.add_argument("--host", default="127.0.0.1")
++    parser.add_argument("--port", type=int, default=42100)
++    parser.add_argument("--token", required=True, help="Bearer token for MCP clients")
++    parser.add_argument("--mesospim-host", default="127.0.0.1")
++    parser.add_argument("--mesospim-port", type=int, default=42000)
++    parser.add_argument("--mesospim-token", help="mesoSPIM TCP token; defaults to --token")
++    parser.add_argument("--timeout", type=float, default=30.0)
++    parser.add_argument("--quiet", action="store_true")
++    args = parser.parse_args(argv)
++    args.mesospim_token = args.mesospim_token if args.mesospim_token is not None else args.token
++    server = ThreadingHTTPServer((args.host, args.port), make_mcp_handler(args))
++    print(f"mesoSPIM MCP server listening on http://{args.host}:{args.port}/mcp", flush=True)
++    server.serve_forever()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/mesoSPIM/src/mesoSPIM_RemoteControl_Tab.py b/mesoSPIM/src/mesoSPIM_RemoteControl_Tab.py
+new file mode 100644
+index 0000000..85b9bb8
+--- /dev/null
++++ b/mesoSPIM/src/mesoSPIM_RemoteControl_Tab.py
+@@ -0,0 +1,222 @@
++"""The Remote Control tab: owns its widgets, its settings, and the MCP child process.
++
++Follows the project's convention for optional features (mesoSPIM_Optimizer,
++ProcessorChainWindow): take the MainWindow as parent and reach back through it for the
++Core, the package directory and the tab bar. MainWindow keeps only a handle and a
++teardown call.
++"""
++import secrets
++
++from PyQt5 import QtCore, QtWidgets
++
++TCP_PORT = 42000
++MCP_PORT = 42100
++
++
++class RemoteControlTab(QtWidgets.QWidget):
++    """Self-contained Remote Control GUI.
++
++    The two signals are emitted to Core through a queued connection so the server's socket
++    is created on the Core's own thread, which is where it must live. MainWindow keeps only
++    a handle to this object and calls shutdown() on close.
++    """
++
++    sig_start_remote_control = QtCore.pyqtSignal(str, int, str)
++    sig_stop_remote_control = QtCore.pyqtSignal()
++
++    def __init__(self, parent):
++        super().__init__(parent.TabWidget)
++        self.main_window = parent  # modal parent for the dialogs; self would re-centre them
++        self.core = parent.core
++        self.package_directory = parent.package_directory
++        self.running = False
++        self.mode = 'TCP'
++        self.host = '127.0.0.1'
++        self.port = TCP_PORT
++        self.token = 'smart_mesospim'
++        self._pending_mcp = None
++        self._mcp_process = None
++        self.setObjectName('RemoteControlTabWidget')
++        self._build_ui()
++        self.sig_start_remote_control.connect(
++            self.core.start_remote_control, type=QtCore.Qt.QueuedConnection)
++        self.sig_stop_remote_control.connect(
++            self.core.stop_remote_control, type=QtCore.Qt.QueuedConnection)
++        self.core.sig_remote_control_started.connect(self.on_started)
++        index = parent.TabWidget.indexOf(parent.TimelapseTabWidget)
++        if index >= 0:
++            parent.TabWidget.insertTab(index + 1, self, 'Remote Control')
++        else:
++            parent.TabWidget.addTab(self, 'Remote Control')
++        self.update_mode_note()
++        self.refresh()
++
++    def _build_ui(self):
++        """Build the tab exactly as MainWindow built it: same object names, labels, fonts,
++        margins, spacing and defaults. This is a move, not a redesign."""
++        layout = QtWidgets.QVBoxLayout(self)
++        layout.setContentsMargins(10, 10, 10, 10)
++        layout.setSpacing(10)
++
++        group = QtWidgets.QGroupBox('Setup remote control', self)
++        group.setObjectName('RemoteControlSetupGroupBox')
++        font = group.font()
++        font.setPointSize(12)
++        group.setFont(font)
++        form = QtWidgets.QFormLayout(group)
++        form.setContentsMargins(10, 30, 10, 10)
++        form.setSpacing(8)
++
++        self.RemoteControlModeComboBox = QtWidgets.QComboBox(group)
++        self.RemoteControlModeComboBox.addItems(['TCP', 'MCP'])
++        self.RemoteControlModeComboBox.setCurrentText(self.mode)
++        self.RemoteControlHostLineEdit = QtWidgets.QLineEdit(self.host, group)
++        self.RemoteControlPortLineEdit = QtWidgets.QLineEdit(str(self.port), group)
++        self.RemoteControlTokenLineEdit = QtWidgets.QLineEdit(self.token, group)
++        self.RemoteControlStatusLabel = QtWidgets.QLabel(group)
++        for widget in self._inputs():
++            widget.setFont(font)
++        self.RemoteControlStatusLabel.setFont(font)
++
++        def form_label(text):
++            label = QtWidgets.QLabel(text, group)
++            label.setFont(font)
++            return label
++
++        form.addRow(form_label('Protocol'), self.RemoteControlModeComboBox)
++        form.addRow(form_label('Host'), self.RemoteControlHostLineEdit)
++        form.addRow(form_label('Port'), self.RemoteControlPortLineEdit)
++        form.addRow(form_label('Password'), self.RemoteControlTokenLineEdit)
++        form.addRow(form_label('Status'), self.RemoteControlStatusLabel)
++
++        self.RemoteControlStartButton = QtWidgets.QPushButton('Start', group)
++        self.RemoteControlStopButton = QtWidgets.QPushButton('Stop', group)
++        self.RemoteControlStartButton.setFont(font)
++        self.RemoteControlStopButton.setFont(font)
++        buttons = QtWidgets.QHBoxLayout()
++        buttons.addWidget(self.RemoteControlStartButton)
++        buttons.addWidget(self.RemoteControlStopButton)
++        form.addRow(buttons)
++        layout.addWidget(group)
++        layout.addStretch(1)
++
++        self.RemoteControlStartButton.clicked.connect(self.start)
++        self.RemoteControlStopButton.clicked.connect(self.stop)
++        self.RemoteControlModeComboBox.currentTextChanged.connect(self.on_mode_changed)
++
++    def _inputs(self):
++        return (self.RemoteControlModeComboBox, self.RemoteControlHostLineEdit,
++                self.RemoteControlPortLineEdit, self.RemoteControlTokenLineEdit)
++
++    def start(self):
++        """Start the server the operator asked for.
++
++        In MCP mode the bridge is fronted by an internal TCP server on an ephemeral port
++        (hence port 0) with its own generated token; the operator's token guards the MCP
++        endpoint itself. That internal port only becomes known when Core reports back, so
++        the MCP child cannot be launched until on_started() runs.
++        """
++        try:
++            port = int(self.RemoteControlPortLineEdit.text())
++        except ValueError:
++            self._warn('Port must be a number.')
++            return
++        host = self.RemoteControlHostLineEdit.text().strip() or '127.0.0.1'
++        token = self.RemoteControlTokenLineEdit.text().strip()
++        if not token:
++            self._warn('Password is required.')
++            return
++        self.host = host
++        self.port = port
++        self.token = token
++        self.mode = self.RemoteControlModeComboBox.currentText()
++        if self.mode == 'MCP':
++            internal_token = secrets.token_urlsafe(32)
++            self._pending_mcp = (host, port, token, internal_token)
++            self.sig_start_remote_control.emit('127.0.0.1', 0, internal_token)
++        else:
++            self._pending_mcp = None
++            self.sig_start_remote_control.emit(host, port, token)
++
++    def stop(self):
++        self._stop_mcp()
++        self.sig_stop_remote_control.emit()
++        self.running = False
++        self.refresh()
++
++    def shutdown(self):
++        """Tear down on application exit, doing all three things close_app() used to do.
++
++        Killing the MCP child without also emitting the queued stop to Core would leave the
++        TCP server listening; dropping either one leaves something running after exit.
++        """
++        if self.running:
++            self._stop_mcp()
++            self.sig_stop_remote_control.emit()
++            self.running = False
++
++    def on_started(self, ok, message):
++        """Handle Core's queued report of a start attempt.
++
++        On failure the server did NOT start, so the tab must not show "running" -- warn with
++        the reason instead. In MCP mode the internal TCP port is parsed out of the success
++        message and the child is launched; if the child fails, the TCP server that was just
++        started is torn down again so nothing is left half-up.
++        """
++        pending, self._pending_mcp = self._pending_mcp, None
++        if ok and pending is not None:
++            try:
++                tcp_port = int(str(message).rsplit(':', 1)[1])
++            except (IndexError, ValueError):
++                ok, message = False, f'Could not read internal TCP port from: {message}'
++            else:
++                ok, message = self._start_mcp(*pending, tcp_port)
++            if not ok:
++                self.sig_stop_remote_control.emit()
++        self.running = ok
++        if not ok:
++            self._warn(f'Could not start the server: {message}')
++        self.refresh()
++
++    def _start_mcp(self, host, port, token, tcp_token, tcp_port):
++        """Launch the MCP bridge child. It is parented to this tab, so tab teardown reaps it."""
++        from .mesoSPIM_RemoteControl_Servers import start_mcp_server_process
++        ok, message, proc = start_mcp_server_process(
++            self, self.package_directory, host, port, token, tcp_token, tcp_port)
++        if ok:
++            self._mcp_process = proc
++        return ok, message
++
++    def _stop_mcp(self):
++        from .mesoSPIM_RemoteControl_Servers import stop_mcp_server_process
++        if self._mcp_process is not None:
++            stop_mcp_server_process(self._mcp_process)
++            self._mcp_process = None
++
++    def on_mode_changed(self, _mode):
++        self.update_mode_note()
++        self.refresh()
++
++    def update_mode_note(self):
++        """Swap in the other protocol's default port, but never override a port the operator
++        typed themselves."""
++        text = self.RemoteControlPortLineEdit.text()
++        if self.RemoteControlModeComboBox.currentText() == 'MCP':
++            if text == str(TCP_PORT):
++                self.RemoteControlPortLineEdit.setText(str(MCP_PORT))
++        elif text == str(MCP_PORT):
++            self.RemoteControlPortLineEdit.setText(str(TCP_PORT))
++
++    def refresh(self):
++        if self.running:
++            self.RemoteControlStatusLabel.setText(
++                f'{self.mode} running on {self.host}:{self.port}')
++        else:
++            self.RemoteControlStatusLabel.setText('stopped')
++        self.RemoteControlStartButton.setEnabled(not self.running)
++        self.RemoteControlStopButton.setEnabled(self.running)
++        for widget in self._inputs():
++            widget.setEnabled(not self.running)
++
++    def _warn(self, message):
++        QtWidgets.QMessageBox.warning(self.main_window, 'Remote Control', message)
+diff --git a/mesoSPIM/src/mesoSPIM_RemoteControl_ValidateAndRunCommands.py b/mesoSPIM/src/mesoSPIM_RemoteControl_ValidateAndRunCommands.py
+new file mode 100644
+index 0000000..a8a9a30
+--- /dev/null
++++ b/mesoSPIM/src/mesoSPIM_RemoteControl_ValidateAndRunCommands.py
+@@ -0,0 +1,1401 @@
++"""Remote-control command vocabulary and execution.
++
++Transports hand this module a decoded command name plus arguments. The name is checked
++against a fixed allowlist, the arguments are validated against the operator's loaded config,
++and the matching mesoSPIM Core action runs behind a one-operation busy gate.
++
++To add a command:
++    1. write ``_your_command(core, args)`` returning a JSON-serializable dict;
++    2. add one entry to COMMANDS;
++    3. add one entry to _HINTS -- this IS the machine-facing contract, because inputSchema is
++       only {"type": "object"}; an LLM has nothing else to go on;
++    4. add one entry to VALID_CASES in tests/support/contracts.py.
++Add an arm to _validate only if the command takes arguments that could reach the hardware.
++
++Two rules that are not negotiable:
++    - Never return an error after state has changed or hardware work has been queued. Compute
++      everything fallible first (see _acquire_start).
++    - Never call .get() on core.state. Production state is a QObject with __getitem__ only;
++      use _state_get, which is the Mapping shim, not test scaffolding.
++"""
++
++import base64
++import hashlib
++import json
++import logging
++import math
++import os
++
++logger = logging.getLogger(__name__)
++
++_AXES = ("x", "y", "z", "f", "theta")
++_POSITION_KEYS = {"x": "x_pos", "y": "y_pos", "z": "z_pos", "f": "f_pos", "theta": "theta_pos"}
++_STATE_REQUEST_KEYS = (
++    "filter", "zoom", "laser", "intensity", "shutterconfig", "state",
++    "camera_exposure_time", "camera_line_interval",
++    "samplerate", "sweeptime", "ETL_cfg_file",
++    "etl_l_delay_%", "etl_l_ramp_rising_%", "etl_l_ramp_falling_%",
++    "etl_l_amplitude", "etl_l_offset",
++    "etl_r_delay_%", "etl_r_ramp_rising_%", "etl_r_ramp_falling_%",
++    "etl_r_amplitude", "etl_r_offset",
++    "galvo_l_frequency", "galvo_l_amplitude", "galvo_l_offset",
++    "galvo_l_duty_cycle", "galvo_l_phase",
++    "galvo_r_frequency", "galvo_r_offset", "galvo_r_duty_cycle", "galvo_r_phase",
++    "laser_l_delay_%", "laser_l_pulse_%",
++    "laser_r_delay_%", "laser_r_pulse_%",
++    "camera_delay_%", "camera_pulse_%",
++    "camera_display_live_subsampling", "camera_display_acquisition_subsampling",
++    "camera_sensor_mode", "camera_binning", "galvo_amp_scale_w_zoom",
++)
++_MODES = (
++    "live", "snap", "run_selected_acquisition", "run_acquisition_list",
++    "preview_acquisition_with_z_update", "preview_acquisition_without_z_update",
++    "idle", "lightsheet_alignment_mode", "visual_mode",
++)
++_ACQUISITION_FIELDS = (
++    "x_pos", "y_pos", "z_start", "z_end", "z_step", "planes", "rot",
++    "f_start", "f_end", "laser", "intensity", "filter", "zoom",
++    "shutterconfig", "folder", "filename", "image_writer_plugin",
++    "etl_l_offset", "etl_l_amplitude", "etl_r_offset", "etl_r_amplitude",
++    "processing",
++)
++_ACQUISITION_AXIS_FIELDS = {
++    "x_pos": "x", "y_pos": "y", "z_start": "z", "z_end": "z",
++    "f_start": "f", "f_end": "f", "rot": "theta",
++}
++_ACQUISITION_STRING_FIELDS = {
++    "folder", "filename", "image_writer_plugin", "processing",
++}
++_ETL_READBACK_KEYS = (
++    "ETL_cfg_file", "laser", "zoom",
++    "etl_l_delay_%", "etl_l_ramp_rising_%", "etl_l_ramp_falling_%",
++    "etl_l_amplitude", "etl_l_offset",
++    "etl_r_delay_%", "etl_r_ramp_rising_%", "etl_r_ramp_falling_%",
++    "etl_r_amplitude", "etl_r_offset",
++)
++
++READ_ONLY_COMMANDS = frozenset({
++    "hello", "ping", "get_state", "get_position", "get_state_all",
++    "get_config", "get_info", "get_limits", "get_capabilities", "get_progress",
++    "get_snap_image", "self_test", "get_acquisition_list", "stat_files",
++})
++EMERGENCY_COMMANDS = frozenset({
++    "stop", "stop_activity", "time_lapse_stop", "close_shutters",
++})
++FINISHED_SIGNAL_COMMANDS = frozenset({
++    "snap", "run_acquisition_list", "run_selected_acquisition",
++    "acquire_start", "start_live",
++    "start_visual_mode", "start_lightsheet_alignment_mode",
++})
++_ACTIVE_OPERATION_STATES = frozenset({"processing", "stopping"})
++_SNAPSHOT_CHUNK_BYTES = 256 * 1024
++_MAX_SNAPSHOT_CHUNK_BYTES = 512 * 1024
++_NOTHING_SAVED = object()  # tells "acquire_start saved no list" apart from "it saved None"
++_IDLE_OPERATION = {"status": "idle"}
++_PUBLIC_OPERATION_KEYS = ("id", "command", "status", "stop_requested", "warnings", "error")
++
++
++class BusyError(RuntimeError):
++    """Raised when a mutating call arrives while another operation is active."""
++
++
++def _session(core):
++    """The Core-owned remote session. CREATES ONLY at the dispatch boundary.
++
++    The session holds the one active operation, the operation counter, the pending snapshot
++    and -- while acquire_start owns one -- the operator's saved acquisition list. Core owns
++    it rather than the server because a server Stop/Start is one GUI click: were it the
++    server's, restarting mid-acquisition would wipe the busy gate and a client could then
++    drive move_absolute into hardware that is still running. Core-owned keeps it fail-closed.
++
++    The real Core builds this eagerly in __init__, so it is never None. Direct-dispatch fakes
++    never construct a TCP server, so they get one here instead -- on the Core thread, before
++    any handler runs. Never call this from a read path: see _read_session.
++
++    Completion milestones an operation can wait for: "finished", "snap_image", "time_lapse",
++    "preview_returned_idle", and None for a call that completes synchronously.
++    """
++    session = getattr(core, "_remote_session", None)
++    if session is None:
++        session = {"operation": None, "counter": 0, "snapshot": None}
++        core._remote_session = session
++    return session
++
++
++def _read_session(core):
++    """Read-only view of the session; None when absent. Safe on the camera thread.
++
++    capture_snap_image runs there, on a direct signal connection, while the Core thread
++    dispatches commands. If a read could create the session, both threads could build one and
++    the in-flight operation would be lost with the loser.
++    """
++    return getattr(core, "_remote_session", None)
++
++
++def _public_operation(operation):
++    """The client-visible view of an operation: the public keys it happens to carry, and
++    never the internal _completion milestone."""
++    if not isinstance(operation, dict):
++        return dict(_IDLE_OPERATION)
++    return {key: operation[key] for key in _PUBLIC_OPERATION_KEYS if key in operation}
++
++
++def operation_snapshot(core):
++    """Return the public status of the most recent remote operation."""
++    session = _read_session(core)
++    return _public_operation(session["operation"] if session else None)
++
++
++def _active_operation(core):
++    session = _read_session(core)
++    operation = session["operation"] if session else None
++    if isinstance(operation, dict) and operation.get("status") in _ACTIVE_OPERATION_STATES:
++        return operation
++    return None
++
++
++def _begin_operation(core, command, completion=None):
++    active = _active_operation(core)
++    if active is not None:
++        raise BusyError(
++            "system busy: currently processing "
++            f"{active['command']} (operation {active['id']})")
++    session = _session(core)
++    session["counter"] += 1
++    operation = {
++        "id": f"op-{session['counter']:06d}",
++        "command": command,
++        "status": "processing",
++        "_completion": completion,
++    }
++    session["operation"] = operation
++    return operation
++
++
++def _finish_operation(core, status="completed", error=None):
++    session = _read_session(core)
++    operation = session["operation"] if session else None
++    if not isinstance(operation, dict):
++        return False
++    operation["status"] = status
++    if error is not None:
++        operation["error"] = str(error)
++    return True
++
++
++def complete_operation(core, completion):
++    """Complete an operation only when its real completion milestone matches."""
++    operation = _active_operation(core)
++    if operation is None or operation.get("_completion") != completion:
++        return False
++    return _finish_operation(core)
++
++
++def fail_operation(core, completion, error):
++    """Fail an active operation when its matching deferred action raises."""
++    operation = _active_operation(core)
++    if operation is None or operation.get("_completion") != completion:
++        return False
++    return _finish_operation(core, "failed", error)
++
++
++def capture_snap_image(core):
++    """Store a completed remote snap as bounded, chunk-readable raw pixels.
++
++    Called from the camera-frame signal ON THE CAMERA THREAD (the server is a plain object,
++    so the connection is direct) while a remote ``snap`` waits for its image. Live and
++    acquisition frames never enter this store. It writes into a session that must already
++    exist and never creates one.
++    """
++    operation = _active_operation(core)
++    if operation is None or operation.get("_completion") != "snap_image":
++        return False
++    session = _read_session(core)
++    if session is None:
++        return False
++    try:
++        queue = getattr(core, "frame_queue_display", None)
++        if not queue:
++            raise RuntimeError("snapshot camera frame was signalled but no image is available")
++        image = queue[-1]
++        dtype = getattr(image, "dtype", None)
++        shape = getattr(image, "shape", None)
++        tobytes = getattr(image, "tobytes", None)
++        if dtype is None or shape is None or not callable(tobytes):
++            raise TypeError("snapshot image must expose dtype, shape, and tobytes()")
++        if bool(getattr(dtype, "hasobject", False)):
++            raise TypeError("object-dtype snapshot images cannot be transferred")
++        data = tobytes(order="C")
++        if not isinstance(data, bytes) or not data:
++            raise ValueError("snapshot image contains no pixel bytes")
++        session["snapshot"] = {
++            "operation_id": operation["id"],
++            "format": "raw",
++            "dtype": str(getattr(dtype, "str", dtype)),
++            "shape": [int(value) for value in shape],
++            "order": "C",
++            "total_bytes": len(data),
++            "sha256": hashlib.sha256(data).hexdigest(),
++            "_data": data,
++        }
++    except Exception as exc:
++        return fail_operation(core, "snap_image", exc)
++    return complete_operation(core, "snap_image")
++
++
++def _completion_kind(core, call, args):
++    """Which milestone this call must wait for before its operation can complete.
++
++    One of "snap_image", "preview_returned_idle", "finished", "time_lapse", or None when the
++    call completes as soon as the handler returns. The hasattr guards are what decide it: a
++    Core that does not advertise the signal cannot fire it, so its calls stay synchronous --
++    which is exactly how the offline fakes and SimCore run without an event loop.
++    """
++    is_snap = call == "snap" or (call == "set_mode" and args.get("mode") == "snap")
++    if is_snap and hasattr(getattr(core, "camera_worker", None), "sig_camera_frame"):
++        return "snap_image"
++    if call == "preview_acquisition" and hasattr(core, "sig_finished"):
++        return "preview_returned_idle"
++    if call in FINISHED_SIGNAL_COMMANDS and hasattr(core, "sig_finished"):
++        return "finished"
++    if call == "set_mode" and args.get("mode") != "idle" and hasattr(core, "sig_finished"):
++        return "finished"
++    if call == "time_lapse_start" and hasattr(core, "sig_time_lapse_finished"):
++        return "time_lapse"
++    return None
++
++
++def _is_emergency(call, args):
++    return call in EMERGENCY_COMMANDS or (call == "set_mode" and args.get("mode") == "idle")
++
++
++def _accepted(result, command, core, operation=None):
++    output = dict(result) if isinstance(result, dict) else {"result": result}
++    output["accepted"] = True
++    output["accepted_command"] = command
++    output["operation"] = (
++        operation_snapshot(core) if operation is None else _public_operation(operation))
++    return output
++
++
++def _unique_object(pairs):
++    """Build a JSON object while refusing ambiguous duplicate member names."""
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise ValueError(f"duplicate JSON member {key!r}")
++        result[key] = value
++    return result
++
++
++def _finite_json_float(text):
++    value = float(text)
++    if not math.isfinite(value):
++        raise ValueError(f"non-finite JSON number {text!r}")
++    return value
++
++
++def strict_json_loads(payload):
++    """Decode strict JSON: unique object keys and finite numeric values only."""
++    def reject_constant(value):
++        raise ValueError(f"non-finite JSON constant {value!r}")
++
++    return json.loads(
++        payload,
++        object_pairs_hook=_unique_object,
++        parse_float=_finite_json_float,
++        parse_constant=reject_constant,
++    )
++
++
++def parse_call(payload):
++    msg = strict_json_loads(payload)
++    if not isinstance(msg, dict) or len(msg) != 1:
++        raise ValueError("expected one JSON object: {'command': {args}}")
++    (call, args), = msg.items()
++    if not isinstance(call, str):
++        raise ValueError("command name must be a string")
++    if args is None:
++        args = {}
++    if not isinstance(args, dict):
++        raise ValueError("command arguments must be an object")
++    return call, args
++
++
++def tool_specs():
++    return [{"name": n, "description": _HINTS.get(n, f"mesoSPIM {n}"),
++             "inputSchema": {"type": "object"}} for n in COMMANDS]
++
++
++def _item_get(obj, key, default=None):
++    if obj is None:
++        return default
++    get = getattr(obj, "get", None)
++    if callable(get):
++        return get(key, default)
++    try:
++        return obj[key]
++    except (KeyError, TypeError, AttributeError):
++        return default
++
++
++def _state_get(core, key, default=None):
++    return _item_get(getattr(core, "state", None), key, default)
++
++
++def _state_position(core):
++    pos = _state_get(core, "position", {}) or {}
++    return {ax: _item_get(pos, ax, _item_get(pos, ax + "_pos")) for ax in _AXES}
++
++
++def _jsonable(value):
++    if value is None or isinstance(value, (bool, int, float, str)):
++        return value
++    if isinstance(value, dict):
++        return {str(k): _jsonable(v) for k, v in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [_jsonable(v) for v in value]
++    items = getattr(value, "items", None)
++    if callable(items):
++        return {str(k): _jsonable(v) for k, v in items()}
++    return str(value)
++
++
++def _defer(func, *args, **kwargs):
++    from PyQt5 import QtCore
++    QtCore.QTimer.singleShot(0, lambda: func(*args, **kwargs))
++
++
++def _defer_until_returned_idle(core, completion, func, *args, **kwargs):
++    """Run a deferred blocking action and close its gate only after a verified idle return."""
++    def invoke():
++        try:
++            func(*args, **kwargs)
++            state = _state_get(core, "state")
++            if state != "idle":
++                raise RuntimeError(
++                    f"deferred command returned without reaching idle (state={state!r})")
++        except Exception as exc:
++            fail_operation(core, completion, exc)
++            logger.exception("remote deferred operation failed")
++        else:
++            complete_operation(core, completion)
++
++    _defer(invoke)
++
++
++def _state_snapshot(core, keys=None):
++    state = getattr(core, "state", None)
++    if keys is None:
++        raw = getattr(state, "_state_dict", None)
++        keys = list(raw.keys()) if isinstance(raw, dict) else ()
++    get_parameter_dict = getattr(state, "get_parameter_dict", None)
++    if callable(get_parameter_dict):
++        return _jsonable(get_parameter_dict(list(keys)))
++    return {k: _jsonable(_state_get(core, k)) for k in keys}
++
++
++def _cfg_dict(cfg, name):
++    value = getattr(cfg, name, None)
++    return value if isinstance(value, dict) else {}
++
++
++def _camera_pixels(cfg):
++    """The configured sensor size. No guessing: a config without one is a broken config."""
++    params = _cfg_dict(cfg, "camera_parameters")
++    try:
++        return int(params["x_pixels"]), int(params["y_pixels"])
++    except (KeyError, TypeError, ValueError) as exc:
++        raise ValueError(f"camera_parameters is missing or invalid: {exc}") from exc
++
++
++def _move_absolute(core, a):
++    core.move_absolute({k + "_abs": float(v) for k, v in a["targets"].items()}, wait_until_done=True)
++    return {}
++
++
++def _move_relative(core, a):
++    """Move by relative offsets, through the serial worker rather than through Core.
++
++    Core.move_relative(wait_until_done=True) emits a signal instead of performing a
++    synchronous call. Called from the Core-hosted remote server, that can return before the
++    position has changed -- and wedge the next request. MainWindow already calls the serial
++    worker directly for this reason; this takes the same proven path. A Core without one
++    (the offline fakes) falls back to the signal.
++    """
++    move = {k + "_rel": float(v) for k, v in a["deltas"].items()}
++    serial_move = getattr(getattr(core, "serial_worker", None), "move_relative", None)
++    if callable(serial_move):
++        serial_move(move, wait_until_done=True)
++    else:
++        core.move_relative(move, wait_until_done=True)
++    return {}
++
++
++def _zero(core, a):
++    core.zero_axes(list(a.get("axes") or _AXES))
++    return {}
++
++
++def _stop(core, a):
++    core.sig_stop_movement.emit()
++    return {}
++
++
++def _set_state(core, a):
++    settings = dict(a["settings"])
++    invalid = sorted(set(settings) - set(_STATE_REQUEST_KEYS))
++    if invalid:
++        raise ValueError(f"unknown state setting(s): {', '.join(invalid)}")
++    core.state_request_handler(settings)
++    return {}
++
++
++def _settings_from_args(a, keys):
++    settings = {key: a[key] for key in keys if key in a}
++    if not settings:
++        raise ValueError(f"expected one or more of: {', '.join(keys)}")
++    return settings
++
++
++def _set_filter(core, a):
++    core.set_filter(str(a["filter"]), wait_until_done=bool(a.get("wait", False)))
++    return {}
++
++
++def _set_zoom(core, a):
++    zoom = str(a["zoom"])
++    update_etl = bool(a.get("update_etl", True))
++    core.set_zoom(zoom, wait_until_done=bool(a.get("wait", True)),
++                  update_etl=update_etl)
++    return {}
++
++
++def _set_laser(core, a):
++    core.set_laser(str(a["laser"]), wait_until_done=bool(a.get("wait", False)),
++                   update_etl=bool(a.get("update_etl", True)))
++    return {}
++
++
++def _set_intensity(core, a):
++    core.set_intensity(a["intensity"], wait_until_done=bool(a.get("wait", False)))
++    return {}
++
++
++def _set_shutterconfig(core, a):
++    core.set_shutterconfig(str(a["shutterconfig"]))
++    return {}
++
++
++_SETTING_GROUPS = {
++    "set_camera": ("camera_exposure_time", "camera_line_interval", "camera_delay_%",
++                   "camera_pulse_%", "camera_display_live_subsampling",
++                   "camera_display_acquisition_subsampling", "camera_sensor_mode",
++                   "camera_binning"),
++    "set_etl": ("etl_l_delay_%", "etl_l_ramp_rising_%", "etl_l_ramp_falling_%",
++                "etl_l_amplitude", "etl_l_offset", "etl_r_delay_%", "etl_r_ramp_rising_%",
++                "etl_r_ramp_falling_%", "etl_r_amplitude", "etl_r_offset"),
++    "set_galvo": ("galvo_l_frequency", "galvo_l_amplitude", "galvo_l_offset",
++                  "galvo_l_duty_cycle", "galvo_l_phase", "galvo_r_frequency",
++                  "galvo_r_offset", "galvo_r_duty_cycle", "galvo_r_phase",
++                  "galvo_amp_scale_w_zoom"),
++    "set_laser_timing": ("laser_l_delay_%", "laser_l_pulse_%",
++                         "laser_r_delay_%", "laser_r_pulse_%"),
++}
++
++
++def _set_group(core, a, keys):
++    """Send whichever of a command's own settings the caller supplied.
++
++    The four grouped setters differ only by their key tuple, and _validate already treats
++    them identically. Each keeps its own named handler so a traceback and a COMMANDS lookup
++    still name the command the client actually sent.
++    """
++    core.state_request_handler(_settings_from_args(a, keys))
++    return {}
++
++
++def _set_camera(core, a):
++    return _set_group(core, a, _SETTING_GROUPS["set_camera"])
++
++
++def _set_etl(core, a):
++    return _set_group(core, a, _SETTING_GROUPS["set_etl"])
++
++
++def _set_galvo(core, a):
++    return _set_group(core, a, _SETTING_GROUPS["set_galvo"])
++
++
++def _set_laser_timing(core, a):
++    return _set_group(core, a, _SETTING_GROUPS["set_laser_timing"])
++
++
++def _etl_request(core, a, settings):
++    """Apply one ETL settings request and read the result back.
++
++    The three ETL commands share this, including their common ``wait`` default: waiting routes
++    through the blocking state request, so the readback reports what the waveformer actually
++    took rather than what we asked it for. Each command keeps its own argument name, its own
++    state fallback and its own error message, because those are what differ.
++    """
++    if bool(a.get("wait", True)):
++        core.sig_state_request_and_wait_until_done.emit(settings)
++    else:
++        core.sig_state_request.emit(settings)
++    return _state_snapshot(core, _ETL_READBACK_KEYS)
++
++
++def _reload_etl_config(core, a):
++    cfg_file = a.get("path", _state_get(core, "ETL_cfg_file"))
++    if not cfg_file:
++        raise ValueError("path is required when ETL_cfg_file is not set")
++    return _etl_request(core, a, {"ETL_cfg_file": str(cfg_file)})
++
++
++def _update_etl_from_laser(core, a):
++    laser = a.get("laser", _state_get(core, "laser"))
++    if not laser:
++        raise ValueError("laser is required when state['laser'] is not set")
++    return _etl_request(core, a, {"set_etls_according_to_laser": str(laser)})
++
++
++def _update_etl_from_zoom(core, a):
++    zoom = a.get("zoom", _state_get(core, "zoom"))
++    if not zoom:
++        raise ValueError("zoom is required when state['zoom'] is not set")
++    return _etl_request(core, a, {"set_etls_according_to_zoom": str(zoom)})
++
++
++def _hello(core, a):
++    cfg = getattr(core, "cfg", None)
++    return {"app": "mesoSPIM-control", "version": getattr(cfg, "version", None),
++            "protocol": 1, "state": _state_get(core, "state")}
++
++
++def _ping(core, a):
++    return {"pong": True, "state": _state_get(core, "state")}
++
++
++def _get_position(core, a):
++    return _state_position(core)
++
++
++def _get_state(core, a):
++    keys = ("laser", "intensity", "filter", "zoom", "shutterconfig",
++            "etl_l_amplitude", "etl_l_offset", "etl_r_amplitude", "etl_r_offset")
++    out = {"state": _state_get(core, "state"), "position": _state_position(core)}
++    out.update({k: _state_get(core, k) for k in keys})
++    return out
++
++
++def _get_state_all(core, a):
++    keys = a.get("keys")
++    if keys is not None and not isinstance(keys, list):
++        raise ValueError("keys must be a list")
++    return _state_snapshot(core, keys)
++
++
++def _get_config(core, a):
++    cfg = getattr(core, "cfg", None)
++    lasers = [{"name": n, "wavelength_nm": int("".join(c for c in str(n) if c.isdigit()) or 0) or None}
++              for n in _cfg_dict(cfg, "laserdict")]
++    pixelsizes = _cfg_dict(cfg, "pixelsize")
++    zooms = []
++    for z, raw in _cfg_dict(cfg, "zoomdict").items():
++        zooms.append({"name": z, "pixel_size_um": pixelsizes.get(z, raw if isinstance(raw, (int, float)) else None)})
++    pixels_x, pixels_y = _camera_pixels(cfg)
++    return {"app": "mesoSPIM-control", "version": getattr(cfg, "version", None),
++            "lasers": lasers, "filters": list(_cfg_dict(cfg, "filterdict")), "zooms": zooms,
++            "shutter_configs": list(getattr(cfg, "shutteroptions", ["Left", "Right", "Both"])),
++            "axes": list(_AXES),
++            "camera": {"pixels_x": pixels_x, "pixels_y": pixels_y}}
++
++
++def _get_info(core, a):
++    """Return an intentionally extensible, authenticated microscope-info document."""
++    cfg = getattr(core, "cfg", None)
++    writer = getattr(core, "image_writer", None)
++    operation = operation_snapshot(core)
++    return {
++        "app": "mesoSPIM-control",
++        "version": getattr(cfg, "version", None),
++        "protocol": 1,
++        "state": _state_get(core, "state"),
++        "stage_type": _cfg_dict(cfg, "stage_parameters").get("stage_type"),
++        "save_path": _state_get(core, "folder"),
++        "snap_folder": _state_get(core, "snap_folder"),
++        "last_acquisition_path": getattr(writer, "path", None),
++        "etl_config_path": _state_get(core, "ETL_cfg_file"),
++        "operation": operation,
++        "warnings": list(operation.get("warnings", [])),
++    }
++
++
++def _get_limits(core, a):
++    """Report the loaded config's limits, and exactly which of them are enforced.
++
++    "enforced" is what _validate actually applies, so a script or an LLM can read the rules
++    rather than discover them by being refused. A null range means the check is OFF for that
++    key -- only its type is checked -- and the caller can see that.
++    """
++    cfg = getattr(core, "cfg", None)
++    axes = _effective_limits(core)
++    return {"stage": _jsonable(getattr(cfg, "stage_parameters", {})),
++            "camera": _jsonable(getattr(cfg, "camera_parameters", {})),
++            "startup": _jsonable(getattr(cfg, "startup", {})),
++            "enforced": {
++                "axes": {ax: (list(axes[ax]) if ax in axes else None) for ax in _AXES},
++                "parameters": _param_constraints(core)}}
++
++
++def _get_capabilities(core, a):
++    return {
++        "commands": list(COMMANDS),
++        "axes": list(_AXES),
++        "position_keys": dict(_POSITION_KEYS),
++        "settable_state_keys": list(_STATE_REQUEST_KEYS),
++        "modes": list(_MODES),
++        "acquisition_fields": list(_ACQUISITION_FIELDS),
++    }
++
++
++def _self_test(core, a):
++    """Re-run the startup smoke-check on demand, over either transport.
++
++    Drives a mock Core carrying THIS server's real cfg, so a script or an LLM can confirm the
++    loaded limits still refuse an out-of-range call before it starts driving the instrument.
++    Never touches the real hardware.
++    """
++    ok, report = self_test(getattr(core, "cfg", None))
++    return {"ok": ok, "report": report}
++
++
++def _get_progress(core, a):
++    return {"state": _state_get(core, "state"),
++            "current_plane": _state_get(core, "current_framenumber"),
++            "total_planes": _state_get(core, "snap_count"),
++            "current_acquisition": _state_get(core, "current_acquisition"),
++            "total_acquisitions": _state_get(core, "total_acquisitions"),
++            "operation": operation_snapshot(core)}
++
++
++def _get_snap_image(core, a):
++    """Read one bounded chunk of the stored snapshot, with the metadata to reassemble it.
++
++    The reply carries every public key of the stored snapshot (dtype, shape, order,
++    total_bytes, sha256, operation_id), so a client that keeps only the chunks can still
++    rebuild and verify the image.
++    """
++    session = _read_session(core)
++    snapshot = session["snapshot"] if session else None
++    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("_data"), bytes):
++        raise RuntimeError("no remote snapshot is available; call snap and poll completion first")
++    requested_id = a.get("operation_id")
++    if requested_id is not None and requested_id != snapshot["operation_id"]:
++        raise ValueError(
++            f"snapshot {requested_id!r} is unavailable; latest is {snapshot['operation_id']!r}")
++    offset = int(a.get("offset", 0))
++    chunk_size = int(a.get("max_bytes", _SNAPSHOT_CHUNK_BYTES))
++    data = snapshot["_data"]
++    if offset > len(data):
++        raise ValueError(f"offset {offset} exceeds snapshot size {len(data)}")
++    end = min(offset + chunk_size, len(data))
++    out = {key: value for key, value in snapshot.items() if not key.startswith("_")}
++    out.update({
++        "encoding": "base64",
++        "offset": offset,
++        "chunk_bytes": end - offset,
++        "next_offset": end if end < len(data) else None,
++        "complete": end == len(data),
++        "data": base64.b64encode(data[offset:end]).decode("ascii"),
++    })
++    return out
++
++
++def _acquire_start(core, a):
++    """Run one ad-hoc acquisition, stashing the operator's list so acquire_finish can restore it.
++
++    Everything that can fail is computed BEFORE the operator's state is touched or hardware
++    is scheduled. That ordering is the whole point: _camera_pixels raises on a config with
++    no sensor size, and in the old order it raised AFTER acq_list had been replaced and
++    core.start queued -- so the client got an error while the instrument imaged, and run()
++    marked the operation "failed", which is not an active status, leaving the busy gate open
++    for a second acquisition on top of the first. If the deferred start cannot even be
++    queued, the list goes back: an error must never be returned once state has changed.
++    """
++    acq = dict(a["acquisition"])
++    pixels = list(_camera_pixels(getattr(core, "cfg", None)))
++    acq_list = _make_acquisition_list([acq])
++    filename = acq.get("filename") or ""
++    response = {
++        "started": True,
++        "scheduled": True,
++        "files": [os.path.join(acq.get("folder") or "", filename)] if filename else [],
++        "planes": int(acq.get("planes", 1) or 1),
++        "pixels": pixels,
++    }
++    session = _session(core)
++    previous = core.state["acq_list"]
++    session["prev_acq_list"] = previous
++    core.state["acq_list"] = acq_list
++    try:
++        _defer(core.start, row=0)
++    except Exception:
++        core.state["acq_list"] = previous
++        session.pop("prev_acq_list", None)
++        raise
++    return response
++
++
++def _make_acquisition_list(acquisitions):
++    try:
++        from .utils.acquisitions import Acquisition, AcquisitionList
++    except ImportError:
++        from utils.acquisitions import Acquisition, AcquisitionList
++    out = AcquisitionList([])
++    for raw in acquisitions:
++        obj = Acquisition()
++        obj.update({k: v for k, v in dict(raw).items() if v is not None})
++        out.append(obj)
++    return out
++
++
++def _get_acquisition_list(core, a):
++    return {"acquisitions": _jsonable(_state_get(core, "acq_list", []))}
++
++
++def _set_acquisition_list(core, a):
++    acquisitions = a.get("acquisitions")
++    if not isinstance(acquisitions, list):
++        raise ValueError("acquisitions must be a list")
++    core.state["acq_list"] = _make_acquisition_list(acquisitions)
++    row = a.get("selected_row")
++    if row is not None:
++        core.state["selected_row"] = int(row)
++    return {"count": len(core.state["acq_list"])}
++
++
++def _run_acquisition_list(core, a):
++    _defer(core.start, row=None)
++    return {"scheduled": True}
++
++
++def _run_selected_acquisition(core, a):
++    row = int(a.get("row", _state_get(core, "selected_row", 0)))
++    core.state["selected_row"] = row
++    _defer(core.start, row=row)
++    return {"scheduled": True, "row": row}
++
++
++def _preview_acquisition(core, a):
++    row = int(a.get("row", _state_get(core, "selected_row", 0)))
++    core.state["selected_row"] = row
++    _defer_until_returned_idle(
++        core, "preview_returned_idle", core.preview_acquisition,
++        z_update=bool(a.get("z_update", True)))
++    return {"scheduled": True, "row": row}
++
++
++def _stat_files(core, a):
++    files = [str(f) for f in (a.get("files") or [])]
++    return {"missing": [f for f in files if not os.path.isfile(f)],
++            "sizes": {f: os.path.getsize(f) for f in files if os.path.isfile(f)}}
++
++
++def _acquisitions_to_check(core, a):
++    """The list a pre-flight check runs against: the caller's, or the one already loaded.
++
++    Both checks are read-only, so a client can cost an acquisition list before setting it.
++    """
++    if "acquisitions" in a:
++        return _make_acquisition_list(a["acquisitions"])
++    return _state_get(core, "acq_list")
++
++
++def _get_disk_space(core, a):
++    acq_list = _acquisitions_to_check(core, a)
++    return {"free_bytes": int(core.get_free_disk_space(acq_list)),
++            "required_bytes": int(core.get_required_disk_space(acq_list))}
++
++
++def _check_motion_limits(core, a):
++    acq_list = _acquisitions_to_check(core, a)
++    return {"outside_limits": list(core.check_motion_limits(acq_list))}
++
++
++def _acquire_finish(core, a):
++    """Restore the operator's acquisition list, if acquire_start saved one.
++
++    A client may call this standalone, and it must then change nothing. The old code tried
++    `del state["acq_list"]`, which production cannot do -- mesoSPIM_StateSingleton has
++    __setitem__ but no __delitem__, so the subscript slot raises AttributeError -- and the
++    broad `except` turned that into `state["acq_list"] = None`, destroying the list the
++    operator had loaded in the GUI.
++    """
++    previous = _session(core).pop("prev_acq_list", _NOTHING_SAVED)
++    if previous is not _NOTHING_SAVED:
++        core.state["acq_list"] = previous
++    return {"state": _state_get(core, "state")}
++
++
++def _unzero(core, a):
++    core.unzero_axes(list(a.get("axes") or _AXES))
++    return {}
++
++
++def _open_shutters(core, a):
++    core.open_shutters()
++    return {"shutterstate": _state_get(core, "shutterstate")}
++
++
++def _close_shutters(core, a):
++    core.close_shutters()
++    return {"shutterstate": _state_get(core, "shutterstate")}
++
++
++def _stop_activity(core, a):
++    """Stop whatever is running, and do nothing at all if nothing is.
++
++    Re-broadcasting the camera/writer abort while already idle can double-trigger native
++    teardown, so an idempotent stop has to be a real no-op in that state, not a harmless-
++    looking second abort.
++    """
++    if _state_get(core, "state") != "idle":
++        core.stop()
++    return {"state": _state_get(core, "state")}
++
++
++def _snap(core, a):
++    """Take one remote snapshot, cleared of any previous one first.
++
++    The pixels come back through get_snap_image, never through the MainWindow save/prefix
++    dialog: Camera raises that only for write_flag=True.
++    """
++    _session(core)["snapshot"] = None
++    _defer(core.snap, write_flag=False,
++           laser_blanking=bool(a.get("laser_blanking", True)))
++    return {"scheduled": True, "image_stream": "get_snap_image"}
++
++
++def _set_mode(core, a):
++    mode = a["mode"]
++    if mode not in _MODES:
++        raise ValueError(f"unknown mode {mode!r}")
++    if mode == "idle":
++        if _state_get(core, "state") != "idle":
++            core.stop()
++        return {"mode": mode}
++    if mode == "snap":
++        return _snap(core, {})
++    _defer(core.set_state, mode)
++    return {"scheduled": True, "mode": mode}
++
++
++def _start_live(core, a):
++    return _set_mode(core, {"mode": "live"})
++
++
++def _start_visual_mode(core, a):
++    return _set_mode(core, {"mode": "visual_mode"})
++
++
++def _start_lightsheet_alignment_mode(core, a):
++    return _set_mode(core, {"mode": "lightsheet_alignment_mode"})
++
++
++def _load_sample(core, a):
++    params = _cfg_dict(getattr(core, "cfg", None), "stage_parameters")
++    if "y_load_position" not in params:
++        raise ValueError("stage configuration has no y_load_position")
++    core.move_absolute(
++        {"y_abs": float(params["y_load_position"])}, wait_until_done=True,
++        use_internal_position=False)
++    return {}
++
++
++def _unload_sample(core, a):
++    params = _cfg_dict(getattr(core, "cfg", None), "stage_parameters")
++    if "y_unload_position" not in params:
++        raise ValueError("stage configuration has no y_unload_position")
++    core.move_absolute(
++        {"y_abs": float(params["y_unload_position"])}, wait_until_done=True,
++        use_internal_position=False)
++    return {}
++
++
++def _center_sample(core, a):
++    params = _cfg_dict(getattr(core, "cfg", None), "stage_parameters")
++    targets = {
++        axis + "_abs": float(params[key])
++        for axis, key in (("x", "x_center_position"), ("z", "z_center_position"))
++        if key in params
++    }
++    if not targets:
++        raise ValueError("stage configuration has no x_center_position or z_center_position")
++    core.move_absolute(
++        targets, wait_until_done=True, use_internal_position=False)
++    return {}
++
++
++def _execute_stage_program(core, a):
++    core.execute_galil_program()
++    return {}
++
++
++def _save_etl_config(core, a):
++    core.sig_save_etl_config.emit()
++    return {}
++
++
++def _time_lapse_start(core, a):
++    core.run_time_lapse(tpoints=int(a.get("timepoints", 1)),
++                        time_interval_sec=int(a.get("interval_sec", 0)))
++    return {"started": True}
++
++
++def _time_lapse_stop(core, a):
++    core.stop_time_lapse()
++    return {"stopped": True}
++
++
++COMMANDS = {
++    "hello": _hello, "ping": _ping,
++    "get_state": _get_state, "get_position": _get_position,
++    "get_state_all": _get_state_all, "get_config": _get_config, "get_info": _get_info,
++    "get_limits": _get_limits,
++    "get_capabilities": _get_capabilities, "get_progress": _get_progress,
++    "get_snap_image": _get_snap_image,
++    "self_test": _self_test,
++    "move_absolute": _move_absolute, "move_relative": _move_relative,
++    "zero": _zero, "unzero": _unzero,
++    "stop": _stop, "stop_activity": _stop_activity, "set_state": _set_state,
++    "set_filter": _set_filter, "set_zoom": _set_zoom, "set_laser": _set_laser,
++    "set_intensity": _set_intensity, "set_shutterconfig": _set_shutterconfig,
++    "set_camera": _set_camera, "set_etl": _set_etl, "set_galvo": _set_galvo,
++    "set_laser_timing": _set_laser_timing,
++    "reload_etl_config": _reload_etl_config,
++    "update_etl_from_laser": _update_etl_from_laser,
++    "update_etl_from_zoom": _update_etl_from_zoom,
++    "open_shutters": _open_shutters, "close_shutters": _close_shutters,
++    "snap": _snap, "set_mode": _set_mode, "start_live": _start_live,
++    "start_visual_mode": _start_visual_mode,
++    "start_lightsheet_alignment_mode": _start_lightsheet_alignment_mode,
++    "load_sample": _load_sample, "unload_sample": _unload_sample,
++    "center_sample": _center_sample, "execute_stage_program": _execute_stage_program,
++    "save_etl_config": _save_etl_config,
++    "get_acquisition_list": _get_acquisition_list, "set_acquisition_list": _set_acquisition_list,
++    "run_acquisition_list": _run_acquisition_list, "run_selected_acquisition": _run_selected_acquisition,
++    "preview_acquisition": _preview_acquisition,
++    "acquire_start": _acquire_start, "stat_files": _stat_files, "acquire_finish": _acquire_finish,
++    "get_disk_space": _get_disk_space, "check_motion_limits": _check_motion_limits,
++    "time_lapse_start": _time_lapse_start, "time_lapse_stop": _time_lapse_stop,
++}
++
++_HINTS = {
++    "get_info": "report extensible microscope info: app/version, state, stage type, save and "
++                "snap paths, ETL config path, and the current operation. args: none",
++    "get_snap_image": "read the latest remote snapshot in bounded base64 chunks. args: "
++                      "{operation_id?: str, offset?: int, max_bytes?: 1..524288}",
++    "self_test": "verify (against a mock Core with this server's real cfg) that the loaded "
++                 "limits are enforced. args: none. returns {ok, report}. Never moves hardware.",
++    "move_absolute": "move axes to absolute targets. args: {targets: {x,y,z,f,theta: um/deg}}",
++    "move_relative": "move axes by relative offsets. args: {deltas: {axis: um/deg}}",
++    "zero": "define the current position as zero. args: {axes: [..]} (omit = all)",
++    "unzero": "restore physical coordinates for axes. args: {axes: [..]} (omit = all)",
++    "set_state": "change settings. args: {settings: {one or more settable_state_keys}}",
++    "set_camera": "change camera timing/display settings. args: one or more camera_* keys",
++    "set_etl": "change ETL timing/amplitude/offset settings. args: one or more etl_* keys",
++    "set_galvo": "change galvo waveform settings. args: one or more galvo_* keys",
++    "set_laser_timing": "change laser waveform timing/amplitude settings.",
++    "reload_etl_config": "reload ETL values from a CSV. args: {path?: str, wait?: bool}",
++    "update_etl_from_laser": "load ETL values for a laser. args: {laser?: str, wait?: bool}",
++    "update_etl_from_zoom": "load ETL values for a zoom. args: {zoom?: str, wait?: bool}",
++    "set_mode": "run a named mesoSPIM mode. args: {mode: live|snap|run_acquisition_list|...}",
++    "snap": "capture one remote snapshot without GUI dialogs; poll get_progress, then "
++            "read get_snap_image chunks. args: {laser_blanking?: bool, write?: false}",
++    "acquire_start": "start one acquisition. args: {acquisition: {...}}",
++    "set_acquisition_list": "replace the acquisition list. args: {acquisitions: [{...}], selected_row?: int}",
++    "stat_files": "report which output files exist and their sizes. args: {files: [path,..]}",
++}
++
++assert set(_HINTS) <= set(COMMANDS), "every hint must name a real command"
++
++
++def _num(v):
++    """True for finite real numbers (JSON booleans are ints -- exclude them)."""
++    if not isinstance(v, (int, float)) or isinstance(v, bool):
++        return False
++    try:
++        return math.isfinite(v)
++    except OverflowError:
++        return False
++
++
++def _cfg_options(core):
++    """The options the live cfg allows, so we accept exactly what this scope has."""
++    cfg = getattr(core, "cfg", None)
++    return {"filter": list(_cfg_dict(cfg, "filterdict")),
++            "zoom": list(_cfg_dict(cfg, "zoomdict")),
++            "laser": list(_cfg_dict(cfg, "laserdict")),
++            "shutterconfig": list(getattr(cfg, "shutteroptions", []) or [])}
++
++
++# Settable parameters that are text, not numbers (filter/zoom/laser/shutterconfig are
++# handled as cfg-driven enums below, so they are not repeated here).
++_STRING_KEYS = ("state", "ETL_cfg_file", "camera_sensor_mode", "camera_binning")
++# Settable parameters that are a percentage: a number the instrument reads as 0..100.
++_PERCENT_KEYS = tuple(k for k in _STATE_REQUEST_KEYS if k.endswith("%")) + (
++    "intensity", "galvo_l_duty_cycle", "galvo_r_duty_cycle")
++
++
++def _param_constraints(core):
++    """The type + allowed values of every settable parameter, in one place, so the SAME
++    rules that ``_validate`` enforces can be read back by a script/LLM (``get_limits``).
++    Each entry is ``{"type": "number"|"string", "options": [...] or None, "range":
++    [lo, hi] or None}``. ``range`` is ``None`` when no numeric bound is enforced -- the
++    range check is OFF for that key (only its type is checked), which the caller can see.
++    """
++    opts = _cfg_options(core)  # cfg-driven enums for this loaded config
++    spec = {}
++    for k in _STATE_REQUEST_KEYS:
++        if k in opts:
++            spec[k] = {"type": "string", "options": opts[k], "range": None}
++        elif k == "state":
++            spec[k] = {"type": "string", "options": list(_MODES), "range": None}
++        elif k in _PERCENT_KEYS:
++            spec[k] = {"type": "number", "options": None, "range": [0, 100]}
++        elif k in _STRING_KEYS:
++            spec[k] = {"type": "string", "options": None, "range": None}
++        else:
++            spec[k] = {"type": "number", "options": None, "range": None}
++    return spec
++
++
++def _validate(core, call, args, limits):
++    """Reject a call whose ARGS are the wrong shape, not an allowed option, or out of
++    range -- with a clear message -- BEFORE the handler runs, so a bad value never
++    reaches the instrument. Allowed options come from the live ``cfg``; axis ranges
++    come from ``limits`` (per-axis ``{axis: (lo, hi)}``) -- by default the travel
++    envelope of the config the operator loaded at startup (``cfg.stage_parameters``),
++    optionally tightened per axis by ``MESOSPIM_RS_LIMITS``. No limit for an axis =
++    the Core's own hardware bound is the backstop.
++
++    Commands with no arm below have no argument contract on purpose -- the reads, the stops,
++    ``hello``, ``ping`` and ``stat_files`` take nothing that could reach the hardware.
++    """
++    def bad(msg):
++        raise ValueError(f"{call}: {msg}")
++
++    spec = _param_constraints(core)
++
++    def check(key, value):
++        """Type + range + option check for one settable parameter, from the shared spec.
++        A key with no spec entry is not our contract -- leave it to the handler."""
++        s = spec.get(key)
++        if s is None:
++            return
++        if s["type"] == "number":
++            if not _num(value):
++                bad(f"{key} must be a number, got {value!r}")
++            rng = s["range"]
++            if rng and not (rng[0] <= value <= rng[1]):
++                bad(f"{key}={value} is outside the allowed range {tuple(rng)}")
++        elif s["type"] == "string" and not isinstance(value, str):
++            bad(f"{key} must be a string, got {value!r}")
++        if s["options"] and value not in s["options"]:
++            bad(f"{key}={value!r} is not one of {s['options']}")
++
++    def check_acquisition(acquisition, label):
++        if not isinstance(acquisition, dict):
++            bad(f"{label} must be an object")
++        unknown = sorted(set(acquisition) - set(_ACQUISITION_FIELDS))
++        if unknown:
++            bad(f"{label} has unknown field(s): {', '.join(unknown)}")
++        for key, value in acquisition.items():
++            check(key, value)
++        for field, axis in _ACQUISITION_AXIS_FIELDS.items():
++            if field not in acquisition:
++                continue
++            value = acquisition[field]
++            if not _num(value):
++                bad(f"{label}.{field} must be a number, got {value!r}")
++            lo_hi = limits.get(axis)
++            if lo_hi and not (lo_hi[0] <= value <= lo_hi[1]):
++                bad(
++                    f"{label}.{field}={value} is outside the allowed "
++                    f"{axis} range {tuple(lo_hi)}")
++        if "z_step" in acquisition:
++            value = acquisition["z_step"]
++            if not _num(value) or value <= 0:
++                bad(f"{label}.z_step must be a positive number, got {value!r}")
++        if "planes" in acquisition:
++            value = acquisition["planes"]
++            if not _num(value) or value < 1 or int(value) != value:
++                bad(f"{label}.planes must be a positive integer, got {value!r}")
++        for field in _ACQUISITION_STRING_FIELDS:
++            if field in acquisition and not isinstance(acquisition[field], str):
++                bad(f"{label}.{field} must be a string, got {acquisition[field]!r}")
++
++    def check_row(value, count, key="row"):
++        """Reject a row that is not a real index into the acquisition list.
++
++        An empty list plus row 0 is the existing clear-list contract, so it is allowed.
++        Anything else must be a genuine index: the Core call it feeds is deferred, so a bad
++        row would fail later, off the request, where the client can no longer be told.
++        """
++        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
++            bad(f"'{key}' must be a non-negative integer")
++        if (count == 0 and value != 0) or (count > 0 and value >= count):
++            bad(f"'{key}'={value} is outside the acquisition-list range 0..{max(0, count - 1)}")
++
++    if call in ("move_absolute", "move_relative"):
++        key = "targets" if call == "move_absolute" else "deltas"
++        moves = args.get(key)
++        if not isinstance(moves, dict) or not moves:
++            bad(f"'{key}' must be a non-empty object of axis -> number")
++        for axis, value in moves.items():
++            if axis not in _AXES:
++                bad(f"unknown axis {axis!r}; allowed: {list(_AXES)}")
++            if not _num(value):
++                bad(f"axis {axis!r} value must be a number, got {value!r}")
++            lo_hi = limits.get(axis)
++            if call == "move_absolute" and lo_hi and not (lo_hi[0] <= value <= lo_hi[1]):
++                bad(f"{axis}={value} is outside the allowed range {tuple(lo_hi)}")
++            if call == "move_relative" and lo_hi:
++                current = _state_position(core).get(axis)
++                if not _num(current):
++                    bad(f"cannot verify relative move for {axis!r}: current position unavailable")
++                destination = current + value
++                if not _num(destination) or not (lo_hi[0] <= destination <= lo_hi[1]):
++                    bad(f"{axis} destination {destination} is outside the allowed range {tuple(lo_hi)}")
++    elif call in ("zero", "unzero"):
++        axes = args.get("axes")
++        if axes is not None and (not isinstance(axes, list) or any(a not in _AXES for a in axes)):
++            bad(f"'axes' must be a list of {list(_AXES)}")
++    elif call in ("set_filter", "set_zoom", "set_laser", "set_shutterconfig"):
++        field = call[len("set_"):]
++        if field not in args:
++            bad(f"'{field}' is required")
++        check(field, args[field])
++    elif call == "set_intensity":
++        if "intensity" not in args:
++            bad("'intensity' is required")
++        check("intensity", args["intensity"])
++    elif call == "set_state":
++        settings = args.get("settings")
++        if not isinstance(settings, dict) or not settings:
++            bad("'settings' must be a non-empty object")
++        for k, v in settings.items():
++            check(k, v)
++        if settings.get("state") == "snap":
++            bad("state='snap' is GUI-oriented; use the snap command for remote pixels")
++    elif call in ("set_camera", "set_etl", "set_galvo", "set_laser_timing"):
++        for k, v in args.items():  # args ARE the settings for these calls
++            check(k, v)
++    elif call == "acquire_start":
++        check_acquisition(args.get("acquisition"), "acquisition")
++    elif call == "set_acquisition_list":
++        acquisitions = args.get("acquisitions")
++        if not isinstance(acquisitions, list):
++            bad("'acquisitions' must be a list")
++        for index, acquisition in enumerate(acquisitions):
++            check_acquisition(acquisition, f"acquisitions[{index}]")
++        if "selected_row" in args:
++            check_row(args["selected_row"], len(acquisitions), "selected_row")
++    elif call in ("run_selected_acquisition", "preview_acquisition"):
++        acquisitions = _state_get(core, "acq_list", []) or []
++        try:
++            count = len(acquisitions)
++        except TypeError:
++            count = 0
++        check_row(args.get("row", _state_get(core, "selected_row", 0)), count)
++        if call == "preview_acquisition" and "z_update" in args and not isinstance(
++                args["z_update"], bool):
++            bad("'z_update' must be a boolean")
++    elif call == "time_lapse_start":
++        timepoints = args.get("timepoints", 1)
++        interval = args.get("interval_sec", 0)
++        if not isinstance(timepoints, int) or isinstance(timepoints, bool) or timepoints < 1:
++            bad("'timepoints' must be a positive integer")
++        if not _num(interval) or interval < 0:
++            bad("'interval_sec' must be a non-negative number")
++    elif call == "snap":
++        unknown = sorted(set(args) - {"write", "laser_blanking"})
++        if unknown:
++            bad(f"unknown argument(s): {', '.join(unknown)}")
++        if "write" in args and not isinstance(args["write"], bool):
++            bad("'write' must be a boolean")
++        if args.get("write") is True:
++            bad("'write=true' is GUI-only; remote snapshots are returned by get_snap_image")
++        if "laser_blanking" in args and not isinstance(args["laser_blanking"], bool):
++            bad("'laser_blanking' must be a boolean")
++    elif call == "get_snap_image":
++        unknown = sorted(set(args) - {"operation_id", "offset", "max_bytes"})
++        if unknown:
++            bad(f"unknown argument(s): {', '.join(unknown)}")
++        operation_id = args.get("operation_id")
++        if operation_id is not None and not isinstance(operation_id, str):
++            bad("'operation_id' must be a string")
++        offset = args.get("offset", 0)
++        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
++            bad("'offset' must be a non-negative integer")
++        max_bytes = args.get("max_bytes", _SNAPSHOT_CHUNK_BYTES)
++        if (not isinstance(max_bytes, int) or isinstance(max_bytes, bool)
++                or not 1 <= max_bytes <= _MAX_SNAPSHOT_CHUNK_BYTES):
++            bad(f"'max_bytes' must be an integer in 1..{_MAX_SNAPSHOT_CHUNK_BYTES}")
++
++
++def _limits_from_env():
++    """Optional per-axis soft travel limits so ``move_absolute`` refuses out-of-range
++    targets. Read from ``MESOSPIM_RS_LIMITS`` -- a JSON object ``{"x": [lo, hi], ...}``
++    or a path to a file holding one. Unset or invalid -> no soft limit (the Core's own
++    hardware limit is the backstop).
++    """
++    raw = os.environ.get("MESOSPIM_RS_LIMITS", "").strip()
++    if not raw:
++        return {}
++    try:
++        if os.path.isfile(raw):
++            with open(raw, encoding="utf-8") as f:
++                raw = f.read()
++        return {axis: (float(lo), float(hi))
++                for axis, (lo, hi) in strict_json_loads(raw).items()}
++    except Exception:
++        logger.warning("MESOSPIM_RS_LIMITS ignored (want JSON of axis -> [lo, hi])")
++        return {}
++
++
++_LIMITS = _limits_from_env()
++
++
++def _limits_from_cfg(core):
++    """Per-axis soft travel limits from the config the operator loaded at startup.
++    mesoSPIM keeps them in ``cfg.stage_parameters`` as ``{axis}_min`` / ``{axis}_max``
++    (e.g. ``x_min`` / ``x_max``); we turn each pair into ``{axis: (lo, hi)}``. This is
++    why range validation just works out of the box -- if the operator picked the config
++    for this scope, its real travel envelope is already the limit, no extra setup.
++    """
++    sp = _cfg_dict(getattr(core, "cfg", None), "stage_parameters")
++    out = {}
++    for axis in _AXES:
++        lo, hi = sp.get(f"{axis}_min"), sp.get(f"{axis}_max")
++        if _num(lo) and _num(hi):
++            out[axis] = (float(lo), float(hi))
++    return out
++
++
++def _effective_limits(core):
++    """The limits actually enforced: the loaded config's travel envelope, with any
++    ``MESOSPIM_RS_LIMITS`` axis overriding it (so an operator can set a tighter soft
++    limit than the hardware allows). Env-only axes are honoured too.
++    """
++    limits = _limits_from_cfg(core)
++    limits.update(_LIMITS)
++    return limits
++
++
++def run(core, call, args=None):
++    handler = COMMANDS.get(call)
++    if handler is None:
++        raise KeyError(f"unknown command {call!r}; not in the allowlist")
++    args = args or {}
++    _validate(core, call, args, _effective_limits(core))
++    if call in READ_ONLY_COMMANDS:
++        return handler(core, args)
++
++    active = _active_operation(core)
++    if _is_emergency(call, args) and active is not None:
++        if call in {"stop", "stop_activity", "time_lapse_stop"} or (
++                call == "set_mode" and args.get("mode") == "idle"):
++            active["status"] = "stopping"
++            active["stop_requested"] = True
++        result = handler(core, args)
++        return _accepted(result, call, core, active)
++
++    completion = _completion_kind(core, call, args)
++    operation = _begin_operation(core, call, completion)
++    try:
++        result = handler(core, args)
++    except Exception as exc:
++        _finish_operation(core, "failed", exc)
++        raise
++    if completion is None:
++        _finish_operation(core)
++    return _accepted(result, call, core, operation)
++
++
++class SimCore:
++    """A stand-in Core that carries the REAL ``cfg`` (so the REAL limits) but SIMULATES the
++    hardware: a move just updates an in-memory position -- nothing physical happens. The
++    startup smoke-check drives this instead of the instrument, so it can check -- on THIS
++    machine, with THIS loaded config -- that a good call is accepted and an out-of-limit one
++    is refused, before the real server ever goes live.
++    """
++
++    def __init__(self, cfg):
++        self.cfg = cfg
++        self.state = {"state": "idle", "position": {a + "_pos": 0.0 for a in _AXES}}
++        self.moves = []  # every move that reached the (mock) hardware -- rejected ones never do
++
++    def move_absolute(self, sdict, wait_until_done=False, **_):
++        self.moves.append(sdict)
++        for key, val in sdict.items():
++            self.state["position"][key.replace("_abs", "") + "_pos"] = float(val)
++
++    def set_intensity(self, value, wait_until_done=False, **_):
++        self.state["intensity"] = value
++
++    def set_filter(self, value, wait_until_done=False, **_):
++        self.state["filter"] = value
++
++
++def self_test(cfg):
++    """Pre-flight smoke-check: are the loaded config's limits actually ENFORCED?
++
++    Runs a battery through the SAME ``run()`` dispatch both transports use -- so this one
++    check covers the TCP and the MCP lane alike -- against a :class:`SimCore` that mimics the
++    hardware. A valid move must be accepted (and reach the mock stage); an out-of-limit move,
++    a bad option, and an unknown command must all be refused (and NOT reach the mock stage).
++    It is a smoke-check, not a proof: it samples the envelope rather than exhausting it, and
++    it is the guard against a drifted limits file or a validation quirk, not against every
++    possible one. The server refuses to bind if it fails. Returns ``(ok, report_lines)`` and
++    never touches the real instrument.
++    """
++    sim = SimCore(cfg)
++    report, ok = [], True
++
++    def note(good, line):
++        nonlocal ok
++        ok = ok and good
++        report.append(("PASS " if good else "FAIL ") + line)
++
++    def accepts(call, args):
++        try:
++            run(sim, call, args)
++            return True
++        except Exception:
++            return False
++
++    note(accepts("get_limits", {}), "get_limits responds")
++    note(accepts("get_position", {}), "get_position responds")
++
++    limits = _effective_limits(sim)
++    if not limits:
++        note(False, "no axis has a limit -- cannot verify enforcement (check the config's "
++                    "stage_parameters); refusing to go live")
++        return ok, report
++
++    sim.moves.clear()
++    expected_moves = 0
++    for axis, (lo, hi) in limits.items():
++        note(accepts("move_absolute", {"targets": {axis: hi}}), f"in-range move {axis}={hi} accepted")
++        expected_moves += 1
++        note(not accepts("move_absolute", {"targets": {axis: hi + 1}}), f"over-max move {axis}={hi + 1} refused")
++        note(not accepts("move_absolute", {"targets": {axis: lo - 1}}), f"under-min move {axis}={lo - 1} refused")
++    note(not accepts("set_intensity", {"intensity": 250}), "over-range intensity=250 refused")
++    note(not accepts("move_absolute", {"targets": {"nope": 0}}), "unknown axis refused")
++    note(not accepts("__import__", {}), "unknown command refused")
++    note(len(sim.moves) == expected_moves,
++         f"only the {expected_moves} in-range move(s) reached the mock hardware ({len(sim.moves)} recorded)")
++    return ok, report
+diff --git a/mesoSPIM/src/test_remote_control_validation.py b/mesoSPIM/src/test_remote_control_validation.py
+new file mode 100644
+index 0000000..0ee8029
+--- /dev/null
++++ b/mesoSPIM/src/test_remote_control_validation.py
+@@ -0,0 +1,320 @@
++"""Validation tests for the Remote Control command module.
++
++Qt-free and no live Core: exercises ``_validate`` (the arg gate that runs at the
++single ``run()`` choke point, so both the TCP and MCP lanes enforce it) against a
++tiny fake ``cfg``, plus the ``MESOSPIM_RS_LIMITS`` env parser. Run either way::
++
++    pytest mesoSPIM/src/test_remote_control_validation.py
++    python  mesoSPIM/src/test_remote_control_validation.py
++"""
++import base64
++import hashlib
++import importlib.util
++import os
++from pathlib import Path
++import types
++
++_MOD = Path(__file__).with_name("mesoSPIM_RemoteControl_ValidateAndRunCommands.py")
++_spec = importlib.util.spec_from_file_location("_rc_vrc", _MOD)
++vrc = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(vrc)
++
++
++class _Cfg:
++    filterdict = {"Empty": 0, "515LP": 1}
++    zoomdict = {"1x": 1, "2x": 2}
++    laserdict = {"488 nm": 0, "561 nm": 1}
++    shutteroptions = ["Left", "Right", "Both"]
++    # the per-axis travel envelope mesoSPIM loads at startup (theta omitted on purpose,
++    # so the tests can see an axis whose range check is OFF)
++    stage_parameters = {"x_min": -25000, "x_max": 25000, "y_min": -50000, "y_max": 50000,
++                        "z_min": -25000, "z_max": 25000, "f_min": 0, "f_max": 98000}
++
++
++class _FakeState:
++    """The access surface of the production mesoSPIM_StateSingleton, and nothing more.
++
++    Production state (mesoSPIM_State.py:103-172) is a QObject with __getitem__ (raising
++    KeyError), __setitem__, __len__, set_parameters, get_parameter_dict, get_parameter_list
++    and block_signals. It has no .get(), no __contains__ and no __delitem__. A dict fake
++    would green-light remote-control code that dies on the instrument, so the tests below
++    use this. It is spelled out here rather than imported because this file ships inside
++    mesoSPIM and cannot reach the standalone tests/ suite.
++    """
++
++    def __init__(self, **values):
++        self._state_dict = dict(values)
++
++    def __getitem__(self, key):
++        return self._state_dict[key]  # KeyError on a miss, like production
++
++    def __setitem__(self, key, value):
++        self._state_dict[key] = value
++
++    def __len__(self):
++        return len(self._state_dict)
++
++    def set_parameters(self, values):
++        self._state_dict.update(values)
++
++    def get_parameter_dict(self, keys):
++        return {key: self._state_dict[key] for key in keys}
++
++    def get_parameter_list(self, keys):
++        return [self._state_dict[key] for key in keys]
++
++    def block_signals(self, _boolean):
++        pass
++
++
++class _Core:
++    cfg = _Cfg()
++
++
++_core = _Core()
++_LIMITS = {"x": (-1000.0, 1000.0), "y": (-1000.0, 1000.0), "z": (-1000.0, 1000.0)}
++
++
++def _rejects(call, args):
++    try:
++        vrc._validate(_core, call, args, _LIMITS)
++    except ValueError:
++        return True
++    return False
++
++
++def test_valid_calls_pass():
++    vrc._validate(_core, "move_absolute", {"targets": {"x": 100, "y": -50}}, _LIMITS)
++    vrc._validate(_core, "set_filter", {"filter": "Empty"}, _LIMITS)
++    vrc._validate(_core, "set_zoom", {"zoom": "2x"}, _LIMITS)
++    vrc._validate(_core, "set_intensity", {"intensity": 50}, _LIMITS)
++    vrc._validate(_core, "get_state", {}, _LIMITS)  # no arg contract -> passes
++
++
++def test_out_of_range_move_rejected():
++    assert _rejects("move_absolute", {"targets": {"x": 999999}})
++
++
++def test_unknown_axis_rejected():
++    assert _rejects("move_absolute", {"targets": {"q": 1}})
++
++
++def test_non_number_move_rejected():
++    assert _rejects("move_absolute", {"targets": {"x": "far"}})
++
++
++def test_empty_targets_rejected():
++    assert _rejects("move_absolute", {"targets": {}})
++
++
++def test_bad_filter_option_rejected():
++    assert _rejects("set_filter", {"filter": "NOPE"})
++
++
++def test_bad_zoom_option_rejected():
++    assert _rejects("set_zoom", {"zoom": "99x"})
++
++
++def test_bad_shutter_option_rejected():
++    assert _rejects("set_shutterconfig", {"shutterconfig": "Sideways"})
++
++
++def test_bad_intensity_rejected():
++    assert _rejects("set_intensity", {"intensity": 250})
++
++
++def test_bad_set_state_option_rejected():
++    assert _rejects("set_state", {"settings": {"zoom": "77x"}})
++
++
++def test_bad_set_state_mode_rejected():
++    assert _rejects(
++        "set_state", {"settings": {"state": "__invalid_remote_state__"}})
++
++
++def test_limits_from_env_parses_json():
++    os.environ["MESOSPIM_RS_LIMITS"] = '{"x": [-5, 5], "y": [-5, 5]}'
++    try:
++        assert vrc._limits_from_env() == {"x": (-5.0, 5.0), "y": (-5.0, 5.0)}
++    finally:
++        del os.environ["MESOSPIM_RS_LIMITS"]
++
++
++# -- limits come from the loaded config (cfg.stage_parameters), no env var needed -----
++
++def test_limits_default_to_cfg_stage_parameters():
++    lim = vrc._effective_limits(_core)
++    assert lim["x"] == (-25000.0, 25000.0) and lim["f"] == (0.0, 98000.0)
++    assert "theta" not in lim  # no theta_min/max in this cfg -> range OFF for theta
++
++
++def test_run_enforces_cfg_range_without_env():
++    # run() derives limits from cfg, so an out-of-envelope move is refused end-to-end.
++    try:
++        vrc.run(_core, "move_absolute", {"targets": {"x": 999999}})
++    except ValueError:
++        return
++    raise AssertionError("run() did not enforce the cfg stage range")
++
++
++def test_env_override_tightens_cfg_range():
++    saved = vrc._LIMITS
++    vrc._LIMITS = {"x": (-10.0, 10.0)}  # what MESOSPIM_RS_LIMITS would parse to
++    try:
++        assert vrc._effective_limits(_core)["x"] == (-10.0, 10.0)        # env wins for x
++        assert vrc._effective_limits(_core)["y"] == (-50000.0, 50000.0)  # cfg for the rest
++    finally:
++        vrc._LIMITS = saved
++
++
++# -- types + ranges are checked for EVERY settable parameter, not just the stage -------
++
++def test_numeric_setting_type_is_checked():
++    assert _rejects("set_etl", {"etl_l_amplitude": "loud"})       # must be a number
++    assert _rejects("set_camera", {"camera_exposure_time": "x"})  # must be a number
++
++
++def test_percent_setting_range_is_checked():
++    assert _rejects("set_etl", {"etl_l_delay_%": 250})            # 0..100
++    assert not _rejects("set_etl", {"etl_l_amplitude": 1.5})      # no range -> type only
++
++
++def test_acquisition_entrypoints_enforce_ranges_options_and_fields():
++    for call, arguments in (
++        ("acquire_start", {"acquisition": {"intensity": 101}}),
++        ("set_acquisition_list", {
++            "acquisitions": [{"intensity": 101}], "selected_row": 0}),
++        ("acquire_start", {"acquisition": {"x_pos": 1001}}),
++        ("set_acquisition_list", {
++            "acquisitions": [{"filter": "NOPE"}], "selected_row": 0}),
++        ("set_acquisition_list", {
++            "acquisitions": [{"unknown_remote_field": 1}], "selected_row": 0}),
++    ):
++        assert _rejects(call, arguments)
++
++
++def test_acquisition_rows_and_time_lapse_values_are_bounded():
++    assert _rejects(
++        "set_acquisition_list", {"acquisitions": [{}], "selected_row": -1})
++    assert _rejects("run_selected_acquisition", {"row": -1})
++    assert _rejects("preview_acquisition", {"row": 0, "z_update": "yes"})
++    assert _rejects("time_lapse_start", {"timepoints": 0, "interval_sec": 0})
++    assert _rejects("time_lapse_start", {"timepoints": 1, "interval_sec": -1})
++
++
++def test_remote_snap_never_requests_gui_saving_and_chunks_are_bounded():
++    assert not _rejects("snap", {})
++    assert not _rejects("snap", {"write": False, "laser_blanking": True})
++    assert _rejects("snap", {"write": True})
++    assert _rejects("snap", {"laser_blanking": "yes"})
++    assert _rejects("set_state", {"settings": {"state": "snap"}})
++    assert _rejects("get_snap_image", {"offset": -1})
++    assert _rejects("get_snap_image", {"max_bytes": 0})
++    assert _rejects("get_snap_image", {"max_bytes": 512 * 1024 + 1})
++
++
++def test_snapshot_capture_chunks_reconstruct_exact_pixels_and_get_info_reports_it():
++    pixels = b"abcdefghijkl"
++
++    class _Image:
++        dtype = types.SimpleNamespace(str="<u2", hasobject=False)
++        shape = (2, 3)
++
++        def tobytes(self, order="C"):
++            assert order == "C"
++            return pixels
++
++    class _SnapshotCore:
++        """A Core mid-snap: the real one builds this session eagerly in __init__, and
++        capture_snap_image writes into it from the camera thread rather than creating it."""
++
++        cfg = _Cfg()
++
++        def __init__(self):
++            self.state = _FakeState(
++                state="idle", folder="save", snap_folder="snaps", ETL_cfg_file="etl.csv")
++            self.frame_queue_display = [_Image()]
++            self._remote_session = {
++                "operation": {
++                    "id": "op-snap", "command": "snap", "status": "processing",
++                    "_completion": "snap_image", "warnings": ["remote warning"],
++                },
++                "counter": 1,
++                "snapshot": None,
++            }
++
++    core = _SnapshotCore()
++    assert vrc.capture_snap_image(core) is True
++    assert vrc.operation_snapshot(core)["status"] == "completed"
++
++    chunks = []
++    offset = 0
++    while True:
++        result = vrc.run(core, "get_snap_image", {
++            "operation_id": "op-snap", "offset": offset, "max_bytes": 5})
++        chunks.append(base64.b64decode(result["data"]))
++        if result["complete"]:
++            break
++        offset = result["next_offset"]
++    reconstructed = b"".join(chunks)
++    assert reconstructed == pixels
++    assert result["dtype"] == "<u2" and result["shape"] == [2, 3]
++    assert result["sha256"] == hashlib.sha256(pixels).hexdigest()
++
++    info = vrc.run(core, "get_info")
++    assert info["save_path"] == "save" and info["snap_folder"] == "snaps"
++    assert info["warnings"] == ["remote warning"]
++    assert "latest_snapshot" not in info
++    assert "latest_snapshot" not in vrc.run(core, "get_progress")
++    core.state["folder"] = "updated-save"
++    assert vrc.run(core, "get_info")["save_path"] == "updated-save"
++
++
++def test_range_error_names_the_limits():
++    # a too-high value must tell the caller WHAT the limit was, not just "out of range".
++    try:
++        vrc._validate(_core, "move_absolute", {"targets": {"x": 999999}}, {"x": (-25000.0, 25000.0)})
++    except ValueError as e:
++        assert "25000" in str(e) and "-25000" in str(e)
++    else:
++        raise AssertionError("no error raised")
++    try:
++        vrc._validate(_core, "set_intensity", {"intensity": 250}, {})
++    except ValueError as e:
++        assert "100" in str(e)
++    else:
++        raise AssertionError("no error raised")
++
++
++def test_self_test_passes_on_a_good_cfg():
++    # the pre-flight the server runs before going live: against a mock Core with this cfg,
++    # every check must pass (limits enforced), and nothing touches real hardware.
++    ok, report = vrc.self_test(_Cfg())
++    assert ok and all(line.startswith("PASS") for line in report)
++
++
++def test_self_test_fails_closed_when_no_limits():
++    class _NoLimits:
++        filterdict = {}; zoomdict = {}; laserdict = {}; shutteroptions = []  # noqa: E702
++    ok, report = vrc.self_test(_NoLimits())
++    assert not ok and any("cannot verify" in line for line in report)  # refuse to go live
++
++
++def test_get_limits_reports_enforced_rules():
++    enforced = vrc._get_limits(_core, {})["enforced"]
++    assert enforced["axes"]["x"] == [-25000.0, 25000.0]
++    assert enforced["axes"]["theta"] is None                       # range OFF, made visible
++    assert enforced["parameters"]["intensity"]["range"] == [0, 100]
++    assert enforced["parameters"]["etl_l_amplitude"]["range"] is None
++    assert enforced["parameters"]["filter"]["options"] == ["Empty", "515LP"]
++    assert enforced["parameters"]["state"]["options"] == list(vrc._MODES)
++
++
++if __name__ == "__main__":
++    _passed = 0
++    for _name, _fn in sorted(globals().items()):
++        if _name.startswith("test_") and callable(_fn):
++            _fn()
++            print(f"ok   {_name}")
++            _passed += 1
++    print(f"\nALL {_passed} VALIDATION TESTS PASSED")
+diff --git a/pyproject.toml b/pyproject.toml
+index 06b49a5..966d31c 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -37,3 +37,4 @@ dependencies = [
+ 
+ [project.scripts]
+ mesospim-control = "mesoSPIM.mesoSPIM_Control:run"
++mesospim-mcp-server = "mesoSPIM.src.mesoSPIM_RemoteControl_Servers:main"
+-- 
+2.53.0.windows.1
+
