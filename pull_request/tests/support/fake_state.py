@@ -9,6 +9,7 @@ A plain-dict fake silently passes code that dies on the instrument -- ``acquire_
 did exactly that -- so every state-bearing fake uses this instead. The mutex is
 production's concern, not the fake's; the observable access surface is what matters here.
 """
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -26,7 +27,6 @@ DEFAULTS = {
     "shutterconfig": "Both",
     "shutterstate": False,
     "folder": "",
-    "snap_folder": "",
     "ETL_cfg_file": "",
     "etl_l_delay_%": 7.5,
     "etl_l_ramp_rising_%": 85,

@@ -1,0 +1,8 @@
+# Reproducible test/lint environment for the Remote Control contribution.
+#
+# The offline suites install a fake PyQt5 shim (tests/support, impl/tests/conftest),
+# so real PyQt5 is NOT required to run them -- only pytest and ruff. Real PyQt5 and a
+# running mesoSPIM are needed only for the opt-in live/hardware tests, which stay
+# skipped without the MESOSPIM_LIVE_* environment variables.
+pytest==8.3.4
+ruff==0.15.21
