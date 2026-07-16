@@ -163,10 +163,9 @@ the operator does so manually. See [`TESTING.md`](TESTING.md).
 - The five generated modules are byte-identical to `impl/`.
 - Existing Core/MainWindow patch size remains 15 additions and four additions, respectively.
 
-The unified-model Windows build is fully green across both transports. TCP passed its targeted
-native-list regression, complete valid suite, and all six adversarial groups: 9 passed, 0 failed,
-0 skipped. MCP passed its complete valid suite and all six adversarial groups: 8 passed, 0 failed,
-0 skipped. All 53 commands, admission and busy races, acquisition recovery, native-list restoration,
-time-lapse recovery, state restoration, and artifact cleanup passed. Only the final normal
-File > Exit process/port/worker check remains unreported. See
-[`../REVIEW_REPORT.md`](../REVIEW_REPORT.md).
+The final `fecc74f` Windows build is fully green across both transports. TCP and MCP each passed the
+complete valid suite and all six adversarial groups: 8 passed, 0 failed, 0 skipped per transport.
+All 53 commands, admission and busy races, acquisition recovery, native-list restoration,
+time-lapse recovery, state restoration, and artifact cleanup passed. The final normal File > Exit
+check also passed: the process exited, ports 42000 and 42100 closed, and no mesoSPIM, Python, or Qt
+worker remained. See [`../REVIEW_REPORT.md`](../REVIEW_REPORT.md).

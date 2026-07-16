@@ -39,8 +39,8 @@ also contains the main unit-test suite. See [`impl/README.md`](impl/README.md).
 
 [`REVIEW_REPORT.md`](REVIEW_REPORT.md) is the current handoff. The unified asynchronous mutation
 model passes the implementation, generated-patch, formatting, real-PyQt, TCP DemoStage, and MCP
-DemoStage gates. Only the final normal File > Exit process/port/worker check remains before the
-upstream pull request is ready.
+DemoStage gates. The final normal File > Exit process, port, and worker check also passed. The
+contribution is ready for upstream review when the repository owner approves updating PR #105.
 
 ## Licence
 

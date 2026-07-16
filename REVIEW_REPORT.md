@@ -2,14 +2,15 @@
 
 ## Current decision
 
-Status: **the unified asynchronous command model passes all hardware-free, TCP DemoStage, and MCP
-DemoStage command gates. Only the final normal File > Exit teardown remains unreported**.
+Status: **the unified asynchronous command model passes all hardware-free, TCP DemoStage, MCP
+DemoStage, state-restoration, cleanup, and normal-shutdown gates**.
 
 The generated upstream patch is based on
 `mesoSPIM/mesoSPIM-control@b3c9638acb9c15394d4e371cb44e916a2f2e9664`. It also applies cleanly to
 the tested integration base `d16546c` and PR #105's current base `560dcf0`.
 
-Do not update upstream pull request #105 until the final File > Exit check passes on the new build.
+Release testing is complete. Upstream pull request #105 remains unchanged and should be updated only
+after the repository owner gives explicit approval.
 
 ## Why the command model changed
 
@@ -168,15 +169,14 @@ It does not start mesoSPIM or access hardware.
 
 ## Windows DemoStage results
 
-The unified-model build `d2705b5` passed both operator-controlled transports. MCP and TCP were tested
-separately.
+The final product build `fecc74f` passed both operator-controlled transports. MCP and TCP were
+tested separately.
 
 TCP:
 
-- targeted native-list regression: 1 passed in 0.34 seconds;
-- complete valid suite: 2 passed in 49.56 seconds;
-- complete adversarial suite: 6 passed in 19.18 seconds;
-- total: 9 passed, 0 failed, 0 skipped.
+- complete valid suite: 2 passed;
+- complete adversarial suite: 6 passed;
+- total: 8 passed, 0 failed, 0 skipped.
 
 MCP:
 
@@ -187,7 +187,7 @@ MCP:
 Together these gates verified:
 
 - all 53 commands and 37 operational calls;
-- 211 rejected hostile TCP requests;
+- 210 rejected hostile MCP requests and 211 rejected hostile TCP requests;
 - exactly one accepted mutation in the 10-call free-gate race;
 - 16 rejected mutations and eight successful reads during busy stress;
 - acquisition lifecycle and five reconnect-per-call preflight refusals;
@@ -199,11 +199,11 @@ Together these gates verified:
 
 The only runtime warning was the upstream `numcodecs` CRC32C deprecation.
 
-## Remaining operator check
+## Final teardown result
 
-Use **File > Exit** with the final tested build, then confirm that the mesoSPIM process exits
-normally, ports 42000 and 42100 close, and no mesoSPIM or Qt worker remains. Do not force termination
-unless normal shutdown fails and the operator explicitly approves that PID.
+The operator stopped TCP and closed mesoSPIM with **File > Exit**. Process 58744 exited normally,
+ports 42000 and 42100 closed, and no mesoSPIM, Python, or Qt worker remained. No forced termination
+was needed.
 
 ## Adversarial coverage requirement
 
@@ -243,5 +243,6 @@ Remote Control behavior.
 
 ## Release criterion
 
-The complete MCP and TCP valid/adversarial gates are green. Mark the contribution ready after the
-final normal File > Exit teardown check also passes.
+The complete MCP and TCP valid/adversarial gates and the final normal File > Exit teardown are green.
+The contribution is ready for upstream review when the repository owner approves updating pull
+request #105.
