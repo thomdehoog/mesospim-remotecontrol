@@ -1,37 +1,47 @@
 # mesoSPIM Remote Control
 
-A remote-control contribution to [mesoSPIM-control](https://github.com/mesoSPIM/mesoSPIM-control):
-an optional, off-by-default tab that exposes 55 allowlisted commands over framed TCP and over MCP,
-both funnelled through one validated dispatch path.
+This repository contains an optional Remote Control tab for
+[mesoSPIM-control](https://github.com/mesoSPIM/mesoSPIM-control). It is off by default and must be
+started by an operator. It offers the same 53 named commands through framed TCP or a small
+MCP-compatible HTTP endpoint.
 
-This repository holds two different things, and keeps them apart on purpose.
+Only one transport can run at a time. Every ordinary mutation goes through the same validation,
+hardware limits, one-operation-at-a-time gate, accepted-operation reply, and completion polling.
 
-## `pull_request/` — the contribution
+## Repository layout
 
-Everything that is offered to mesoSPIM upstream:
+### `pull_request/`
 
-| | |
-|---|---|
-| `0001-Add-optional-Remote-Control-tab-*.patch` | The change itself: **seven files**, cut against `release/candidate-py312` at `b3c9638`. |
-| `README.md` | The PR description: what it does, the wire protocol, security posture, bench verification. |
-| `ARCHITECTURE.md` | How it fits together: the single choke point, where the session state lives, the threading model, and the known limitations. |
-| `REMOTE_CONTROL_REFERENCE.md` | The API: how to connect, the call format, every command's arguments, and the completion and safety rules. Since MCP's `inputSchema` is only `{"type": "object"}`, this manual *is* the contract an integrator works from. |
-| `TESTING.md` | How to run the suites — **read the part about which code is under test**. |
-| `tests/` | Unit, integration and opt-in live suites, plus the fakes. |
+This is the contribution intended for upstream mesoSPIM:
 
-Run the offline suite from inside `pull_request/`:
+| Path | Purpose |
+| --- | --- |
+| `0001-Add-mesoSPIM-Remote-Control.patch` | The seven-file upstream patch, based on `release/candidate-py312` at `b3c9638` |
+| `README.md` | Feature overview, security, and current verification status |
+| `ARCHITECTURE.md` | Components, threads, operation lifecycle, and known limits |
+| `CALLS.md` | Simple list of all supported TCP and MCP calls |
+| `REMOTE_CONTROL_REFERENCE.md` | Connection details, call format, commands, errors, and polling rules |
+| `TESTING.md` | Offline, real-PyQt, DemoStage, and adversarial test instructions |
+| `tests/` | Automated and operator-gated tests |
+
+Run the hardware-free suite from the repository root:
 
 ```powershell
-python tests/run.py offline all
+python pull_request/tests/run.py offline all
 ```
 
-## Root — how it was built
+### `impl/`
 
-`REFACTOR_PLAN_REVIEWED.md` (policy and scope), `IMPLEMENTATION.md` (the code-level guide),
-`REVIEW_PROMPT.md` and `PLAN.md`. These are the working record of the structural cleanup: what was
-deliberately **not** done and why, the two latent bugs it uncovered, and the reasoning behind the
-decisions a reviewer is most likely to question. They are not part of the contribution.
+This is the readable source used to generate the five new Remote Control modules in the patch. It
+also contains the main unit-test suite. See [`impl/README.md`](impl/README.md).
+
+## Current status
+
+[`REVIEW_REPORT.md`](REVIEW_REPORT.md) is the current handoff. The unified asynchronous mutation
+model passes the implementation, generated-patch, formatting, real-PyQt, TCP DemoStage, and MCP
+DemoStage gates. The final normal File > Exit process, port, and worker check also passed. The
+contribution is ready for upstream review when the repository owner approves updating PR #105.
 
 ## Licence
 
-GPL-3.0, inherited from mesoSPIM-control, which the patch derives from.
+GPL-3.0, inherited from mesoSPIM-control.

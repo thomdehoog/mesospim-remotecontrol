@@ -13,6 +13,7 @@ So the classes are imported through the package -- the real ``Acquisition`` and
 name the command module asks for. Without a source root there is no tree to import from,
 so the patch-file default gets stand-ins with the same access surface.
 """
+
 from __future__ import annotations
 
 import sys
@@ -22,7 +23,13 @@ from tests.support import SOURCE_ROOT
 
 
 class StandInAcquisition(dict):
-    """As much of Acquisition as the command module uses: a dict it can ``update()``."""
+    """Faithful geometry subset of upstream's dict-like Acquisition."""
+
+    def __init__(self):
+        super().__init__(z_start=0, z_end=100, z_step=10, planes=10)
+
+    def get_image_count(self):
+        return abs(round((self["z_end"] - self["z_start"]) / self["z_step"])) + 1
 
 
 class StandInAcquisitionList(list):
@@ -33,6 +40,7 @@ def _classes():
     if SOURCE_ROOT is None:
         return StandInAcquisition, StandInAcquisitionList
     from mesoSPIM.src.utils.acquisitions import Acquisition, AcquisitionList
+
     return Acquisition, AcquisitionList
 
 

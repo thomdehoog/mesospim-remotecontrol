@@ -1,4 +1,5 @@
-"""Pytest grouping for the organized mesoSPIM Remote Control tests."""
+"""Pytest grouping for the mesoSPIM Remote Control tests (five-module architecture)."""
+
 from pathlib import Path
 
 
@@ -8,22 +9,20 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "offline: test that does not require mesoSPIM")
     config.addinivalue_line("markers", "live: opt-in test against a running mesoSPIM")
     config.addinivalue_line("markers", "valid: valid command or protocol test")
+    config.addinivalue_line("markers", "normal: functional, validation, protocol, and viability tests")
+    config.addinivalue_line("markers", "adversarial: bounded hostile-input and transport-abuse tests")
+    config.addinivalue_line("markers", "live_valid: opt-in valid calls that change and restore a live device")
+    config.addinivalue_line("markers", "live_demo_all: opt-in demo-only sweep of every allowlisted command")
     config.addinivalue_line(
-        "markers", "normal: functional, validation, protocol, and viability tests")
-    config.addinivalue_line(
-        "markers", "adversarial: bounded hostile-input and transport-abuse tests")
-    config.addinivalue_line(
-        "markers", "live_valid: opt-in valid calls that change and restore a live device")
-    config.addinivalue_line(
-        "markers", "live_demo_all: opt-in demo-only sweep of every allowlisted command")
-    config.addinivalue_line(
-        "markers", "live_adversarial: opt-in bounded concurrency stress against DemoStage")
+        "markers", "live_adversarial: opt-in bounded concurrency stress against DemoStage"
+    )
 
 
 def pytest_report_header(config):
     """Name the code actually under test, so a refactor can never be validated green
     against stale patch text by accident."""
     from tests.support import patch_loader
+
     return f"remote-control modules under test: {patch_loader.SOURCE}"
 
 
@@ -33,6 +32,8 @@ def pytest_collection_modifyitems(items):
         path = Path(str(item.fspath))
         level = path.parent.name
         module_name = path.name
+        if level == "tests":
+            continue  # a root-level file carries its own markers
         if level == "live":
             markers = ["live"]
             if module_name == "test_adversarial.py":

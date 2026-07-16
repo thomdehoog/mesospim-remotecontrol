@@ -1,0 +1,19 @@
+# Small, deliberate Ruff configuration for the Remote Control contribution.
+#
+# The lint rules focus on concrete defects rather than subjective import ordering. Ruff's formatter
+# separately enforces consistent whitespace and layout across production and test code. Intentional
+# lint exceptions carry an inline `# noqa`.
+line-length = 110
+target-version = "py38"
+
+[lint]
+# F  = pyflakes (undefined names, unused imports/variables) -- real bugs
+# E9 = syntax errors
+# E711/E712/E714 = comparison-to-None/bool/not-is mistakes
+select = ["F", "E9"]
+extend-select = ["E711", "E712", "E714"]
+
+[lint.per-file-ignores]
+# A few test doubles deliberately redefine fixtures while assembling isolated module environments.
+"impl/tests/**" = ["F811"]
+"pull_request/tests/**" = ["F811"]
