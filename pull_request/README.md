@@ -72,8 +72,8 @@ advertises revision `2024-11-05`, and provides `initialize`, `tools/list`, and `
 calls are sent to the same command path as TCP calls. The endpoint is intentionally not a complete
 implementation of newer MCP Streamable HTTP revisions.
 
-The complete format and command table are in
-[`REMOTE_CONTROL_REFERENCE.md`](REMOTE_CONTROL_REFERENCE.md).
+For a quick overview, see [`CALLS.md`](CALLS.md). The complete format, arguments, and examples are
+in [`REMOTE_CONTROL_REFERENCE.md`](REMOTE_CONTROL_REFERENCE.md).
 
 ## Validation and limits
 

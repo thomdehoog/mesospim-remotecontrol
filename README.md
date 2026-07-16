@@ -19,6 +19,7 @@ This is the contribution intended for upstream mesoSPIM:
 | `0001-Add-mesoSPIM-Remote-Control.patch` | The seven-file upstream patch, based on `release/candidate-py312` at `b3c9638` |
 | `README.md` | Feature overview, security, and current verification status |
 | `ARCHITECTURE.md` | Components, threads, operation lifecycle, and known limits |
+| `CALLS.md` | Simple list of all supported TCP and MCP calls |
 | `REMOTE_CONTROL_REFERENCE.md` | Connection details, call format, commands, errors, and polling rules |
 | `TESTING.md` | Offline, real-PyQt, DemoStage, and adversarial test instructions |
 | `tests/` | Automated and operator-gated tests |
