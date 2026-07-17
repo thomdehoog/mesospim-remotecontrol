@@ -51,6 +51,15 @@ The PostgreSQL projection mirrors the Git CAS on `processed_hash`, so two
 servers sharing one database can never silently skip a commit; any
 divergence (crash, foreign push) is repaired by a full rebuild from Git.
 
+## Documentation
+
+- [docs/INSTALL.md](docs/INSTALL.md) — installation tutorial: build, run
+  (in-memory and PostgreSQL), define your first domain, deploy.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — guided tour of the
+  source tree and how a request flows through it.
+- [DESIGN_NOTES.md](DESIGN_NOTES.md) — spec vs. implementation: what was
+  adopted, adapted, skipped, and why.
+
 ## Quickstart
 
 ```sh
