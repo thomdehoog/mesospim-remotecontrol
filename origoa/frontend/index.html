@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Origoa</title>
+    <style>
+      :root {
+        --bg: #f7f8fa;
+        --panel: #ffffff;
+        --border: #dde1e6;
+        --text: #1b1f24;
+        --muted: #6b7480;
+        --accent: #2563eb;
+        --accent-soft: #e8effd;
+        --danger: #b42318;
+        --ok: #087443;
+        font-size: 14px;
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      origoa-app { display: block; height: 100vh; }
+    </style>
+  </head>
+  <body>
+    <origoa-app></origoa-app>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
