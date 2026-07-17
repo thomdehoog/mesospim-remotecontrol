@@ -191,7 +191,7 @@ export class OrigoaApp extends LitElement {
   private renderDetail() {
     const m = this.selected!;
     const fields = (this.data?.fields ?? {}) as Record<string, unknown>;
-    const schemaFields = this.schema?.fields ?? Object.keys(fields).map(id => ({ id, type: 'text' }));
+    const schemaFields: SchemaField[] = this.schema?.fields ?? Object.keys(fields).map(id => ({ id, type: 'text' }));
     return html`
       <h1>${m.title || m.guid}</h1>
       <p class="muted">${m.hid ? m.hid + ' · ' : ''}${m.kind} · ${m.type} · /${m.folder} · ${m.guid}</p>

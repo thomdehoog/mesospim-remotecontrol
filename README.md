@@ -136,7 +136,10 @@ rebuilt (`POST /api/admin/reindex`).
 
 ## Deliberate MVP deviations from the design guide
 
-Documented so they are decisions, not accidents:
+The full rationale — what was adopted, adapted, skipped, what adversarial
+testing taught us, and the remaining gaps — lives in
+[DESIGN_NOTES.md](DESIGN_NOTES.md). Summary, so they are decisions, not
+accidents:
 
 - **Recovery jumps straight to a full rebuild.** The design prefers
   replaying missing commits sequentially and reserves full rebuild for when

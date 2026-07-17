@@ -30,6 +30,21 @@ jobs:
         run: go test -race -count=1 ./...
         env:
           ORIGOA_TEST_DSN: postgres://postgres:postgres@127.0.0.1:5432/origoa_test?sslmode=disable
+      - name: Benchmarks (compile & one pass)
+        run: go test -run xxx -bench . -benchtime 5x ./internal/core/
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Fuzz smoke (30s per target)
+        run: |
+          go test -run xxx -fuzz FuzzRoundTrip  -fuzztime 30s ./internal/ojson/
+          go test -run xxx -fuzz FuzzCleanFolder -fuzztime 30s ./internal/core/
+          go test -run xxx -fuzz FuzzClassify   -fuzztime 30s ./internal/core/
 
   frontend:
     runs-on: ubuntu-latest
@@ -42,4 +57,38 @@ jobs:
         with:
           node-version: 22
       - run: npm install --no-audit --no-fund
+      - name: Typecheck
+        run: npx tsc --noEmit
       - run: npm run build
+
+  e2e:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: origoa_e2e
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build -o bin/origoad ./cmd/origoad
+      - name: E2E (in-memory projection)
+        run: |
+          ./bin/origoad -repo /tmp/e2e-mem.git -addr 127.0.0.1:18080 & pid=$!
+          sleep 1
+          ./scripts/e2e.sh http://127.0.0.1:18080
+          kill $pid
+      - name: E2E (PostgreSQL projection)
+        run: |
+          ./bin/origoad -repo /tmp/e2e-pg.git -addr 127.0.0.1:18081 \
+            -db "postgres://postgres:postgres@127.0.0.1:5432/origoa_e2e?sslmode=disable" & pid=$!
+          sleep 1
+          ./scripts/e2e.sh http://127.0.0.1:18081
+          kill $pid
