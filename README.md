@@ -34,9 +34,22 @@ Four native artifact kinds form the complete information model:
 - **Workflows** (`<scope>/.origoa/workflows/*.json`) are state machines
   resolved lexically; an artifact can participate in several independently.
 - Every logical operation is exactly one Git commit with a structured
-  message, published via compare-and-swap `update-ref` (no working
-  directory, plumbing only). Optimistic concurrency uses the artifact's
-  blob SHA as ETag / `If-Match`.
+  message (human subject + `Origoa-Op`/`Origoa-Guid` trailers), published
+  via compare-and-swap `update-ref` (no working directory, plumbing only).
+  Optimistic concurrency uses the artifact's blob SHA as a quoted `ETag`
+  honored by `If-Match` (RFC 9110 semantics, including `*` and `W/`).
+
+## Write path (design guide §10.1)
+
+Every write runs a validated retry loop: synchronize the projection to the
+Git head, validate and build the changeset against that state, publish with
+one CAS `update-ref`, then project the commit. If the branch moved (a second
+server process, a direct `git push`), the loop re-synchronizes and re-runs
+the whole validation — If-Match, HID uniqueness and move/delete file sets
+are never applied to a stale state, and nothing is ever silently rebased.
+The PostgreSQL projection mirrors the Git CAS on `processed_hash`, so two
+servers sharing one database can never silently skip a commit; any
+divergence (crash, foreign push) is repaired by a full rebuild from Git.
 
 ## Quickstart
 
@@ -53,9 +66,16 @@ With PostgreSQL (plain SQL, no ORM — tables are auto-created):
   -db "postgres://user:pass@localhost:5432/origoa?sslmode=disable"
 ```
 
-`make test` runs `go vet` and the full test suite (including adversarial
-tests) with the race detector against the in-memory projection. Set
-`ORIGOA_TEST_DSN` to run the same suite against PostgreSQL — CI runs both.
+`make test` runs `go vet` and the full test suite with the race detector
+against the in-memory projection. Set `ORIGOA_TEST_DSN` to run the same
+suite against PostgreSQL — CI runs both. Coverage includes adversarial
+suites (path traversal, pathspec-hostile and unicode folder names, NUL
+bytes, multi-megabyte and deeply nested payloads, duplicate HIDs, overlay
+cycles, stale ETags), concurrency torture (mixed operations under
+concurrent reindexing with live-equals-rebuild invariants), two writer
+processes sharing one repository and one projection database, and Go fuzz
+targets for the JSON codec, folder validation and file classification
+(`go test -fuzz FuzzRoundTrip ./internal/ojson`).
 
 ## REST API
 
@@ -80,8 +100,13 @@ GET    /api/workflows/{id}?path=          resolved workflow definition
 PUT    /api/workflows/{name}?scope=       store a workflow definition
 ```
 
-Errors are JSON `{"error": ...}` with 400 (validation), 404, 409 (HID or
-concurrent-edit conflict).
+Errors are JSON `{"error": ...}` with 400 (validation), 404 (also for a
+GUID reached through the wrong collection route), 409 (HID conflict /
+concurrent modification), 412 (stale `If-Match`), 503 (projection store
+unavailable — reads fail closed rather than fabricating empty answers).
+List/search/tree accept `?limit=` (default 1000, max 10000). Request
+bodies are capped at 4 MiB; searchable text per artifact is capped at
+256 KiB and sanitized so no payload can wedge a projection backend.
 
 ## Architecture
 
@@ -116,9 +141,9 @@ Documented so they are decisions, not accidents:
 - **Recovery jumps straight to a full rebuild.** The design prefers
   replaying missing commits sequentially and reserves full rebuild for when
   replay can't continue (§5.14). Rebuild is the safe superset and MVP repos
-  are small; sequential replay is an optimization for later.
-- **The in-memory projection applies writes by full rebuild** — correct by
-  construction; the PostgreSQL projection is the incremental path.
+  are small; sequential replay is an optimization for later. Both
+  projections apply each own commit incrementally; rebuild is only for
+  divergence.
 - **Cardinality is stored but not enforced** — the design assigns
   validation and automation to the application layer. Link *type/target
   allowlists* are enforced because the design names them as constraints.

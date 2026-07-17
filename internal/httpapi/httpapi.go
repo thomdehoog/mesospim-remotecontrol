@@ -5,14 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/thomdehoog/origoa/internal/core"
 	"github.com/thomdehoog/origoa/internal/ojson"
 )
 
-const maxBody = 4 << 20 // 4 MiB request bodies
+const (
+	maxBody      = 4 << 20 // 4 MiB request bodies
+	defaultLimit = 1000
+	maxLimit     = 10000
+)
 
 type Server struct {
 	f *core.Foundation
@@ -26,20 +32,20 @@ func New(f *core.Foundation) http.Handler {
 	mux.HandleFunc("GET /api/search", s.search)
 	mux.HandleFunc("POST /api/admin/reindex", s.reindex)
 
-	for _, r := range []struct{ route, kind string }{
-		{"entries", core.KindEntry}, {"documents", core.KindDocument},
+	// Artifact CRUD; the route's collection is part of the contract, so a
+	// GUID of another kind is 404 on that route.
+	for route, kind := range map[string]string{
+		"entries": core.KindEntry, "documents": core.KindDocument,
+		"links": core.KindLink, "comments": core.KindComment,
 	} {
-		kind := r.kind
-		mux.HandleFunc("POST /api/"+r.route, func(w http.ResponseWriter, req *http.Request) { s.create(w, req, kind) })
+		kind := kind
+		mux.HandleFunc("GET /api/"+route+"/{guid}", func(w http.ResponseWriter, r *http.Request) { s.get(w, r, kind) })
+		mux.HandleFunc("DELETE /api/"+route+"/{guid}", func(w http.ResponseWriter, r *http.Request) { s.delete(w, r, kind) })
 	}
-	mux.HandleFunc("GET /api/entries/{guid}", s.get)
-	mux.HandleFunc("GET /api/documents/{guid}", s.get)
-	mux.HandleFunc("GET /api/links/{guid}", s.get)
-	mux.HandleFunc("GET /api/comments/{guid}", s.get)
-	mux.HandleFunc("PUT /api/entries/{guid}", s.update)
-	mux.HandleFunc("PUT /api/documents/{guid}", s.update)
-	for _, route := range []string{"entries", "documents", "links", "comments"} {
-		mux.HandleFunc("DELETE /api/"+route+"/{guid}", s.delete)
+	for route, kind := range map[string]string{"entries": core.KindEntry, "documents": core.KindDocument} {
+		kind := kind
+		mux.HandleFunc("POST /api/"+route, func(w http.ResponseWriter, r *http.Request) { s.create(w, r, kind) })
+		mux.HandleFunc("PUT /api/"+route+"/{guid}", func(w http.ResponseWriter, r *http.Request) { s.update(w, r, kind) })
 	}
 
 	mux.HandleFunc("POST /api/links", s.createLink)
@@ -68,17 +74,26 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// writeErr maps domain errors to status codes. Internal failures are logged
+// server-side and returned as a generic message — git/db details (paths,
+// revisions, stderr) never leak to clients.
 func writeErr(w http.ResponseWriter, err error) {
-	status := http.StatusInternalServerError
 	switch {
 	case errors.Is(err, core.ErrNotFound):
-		status = http.StatusNotFound
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+	case errors.Is(err, core.ErrPrecondition):
+		writeJSON(w, http.StatusPreconditionFailed, map[string]string{"error": err.Error()})
 	case errors.Is(err, core.ErrConflict):
-		status = http.StatusConflict
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 	case errors.Is(err, core.ErrValidation):
-		status = http.StatusBadRequest
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, core.ErrUnavailable):
+		log.Printf("httpapi: projection unavailable: %v", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "projection temporarily unavailable"})
+	default:
+		log.Printf("httpapi: internal error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 	}
-	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
 
 func readBody(w http.ResponseWriter, req *http.Request, v any) bool {
@@ -93,21 +108,68 @@ func readBody(w http.ResponseWriter, req *http.Request, v any) bool {
 	return true
 }
 
+func limitParam(req *http.Request) int {
+	n, err := strconv.Atoi(req.URL.Query().Get("limit"))
+	if err != nil || n <= 0 {
+		return defaultLimit
+	}
+	return min(n, maxLimit)
+}
+
+// setETag / ifMatch implement RFC 9110 entity-tag syntax over the blob SHA.
+func setETag(w http.ResponseWriter, etag string) {
+	w.Header().Set("ETag", `"`+etag+`"`)
+}
+
+func ifMatch(req *http.Request) string {
+	v := strings.TrimSpace(req.Header.Get("If-Match"))
+	if v == "" || v == "*" { // "*" = any current representation
+		return ""
+	}
+	v = strings.TrimPrefix(v, "W/")
+	return strings.Trim(v, `"`)
+}
+
+// metaOfKind resolves a GUID and enforces the route's artifact kind.
+func (s *Server) metaOfKind(guid, kind string) (*core.Meta, error) {
+	m, err := s.f.Meta(guid)
+	if err != nil {
+		return nil, err
+	}
+	if m.Kind != kind {
+		return nil, core.ErrNotFound
+	}
+	return m, nil
+}
+
 // ---- artifacts ----
 
 func (s *Server) tree(w http.ResponseWriter, req *http.Request) {
+	q := req.URL.Query()
+	subtree := q.Get("subtree") != "0"
+	artifacts, err := s.f.List(q.Get("kind"), q.Get("type"), q.Get("path"), subtree, limitParam(req))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	folders, err := s.f.Folders()
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"rev":       s.f.Head(),
-		"folders":   s.f.Folders(),
-		"artifacts": s.f.List(req.URL.Query().Get("kind"), req.URL.Query().Get("type"), "", true),
+		"rev": s.f.Head(), "folders": folders, "artifacts": artifacts,
 	})
 }
 
 func (s *Server) search(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"artifacts": s.f.Search(q.Get("q"), q.Get("kind"), q.Get("type")),
-	})
+	artifacts, err := s.f.Search(q.Get("q"), q.Get("kind"), q.Get("type"), limitParam(req))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"artifacts": artifacts})
 }
 
 func (s *Server) reindex(w http.ResponseWriter, _ *http.Request) {
@@ -128,10 +190,15 @@ func (s *Server) create(w http.ResponseWriter, req *http.Request, kind string) {
 		writeErr(w, err)
 		return
 	}
+	setETag(w, meta.ETag)
 	writeJSON(w, http.StatusCreated, map[string]any{"meta": meta})
 }
 
-func (s *Server) get(w http.ResponseWriter, req *http.Request) {
+func (s *Server) get(w http.ResponseWriter, req *http.Request, kind string) {
+	if _, err := s.metaOfKind(req.PathValue("guid"), kind); err != nil {
+		writeErr(w, err)
+		return
+	}
 	meta, obj, err := s.f.Artifact(req.PathValue("guid"))
 	if err != nil {
 		writeErr(w, err)
@@ -146,25 +213,33 @@ func (s *Server) get(w http.ResponseWriter, req *http.Request) {
 		}
 		res["resolved"] = map[string]any{"fields": fields, "chain": chain}
 	}
-	w.Header().Set("ETag", meta.ETag)
+	setETag(w, meta.ETag)
 	writeJSON(w, http.StatusOK, res)
 }
 
-func (s *Server) update(w http.ResponseWriter, req *http.Request) {
+func (s *Server) update(w http.ResponseWriter, req *http.Request, kind string) {
+	if _, err := s.metaOfKind(req.PathValue("guid"), kind); err != nil {
+		writeErr(w, err)
+		return
+	}
 	patch := ojson.New()
 	if !readBody(w, req, patch) {
 		return
 	}
-	meta, err := s.f.UpdateArtifact(req.PathValue("guid"), patch, req.Header.Get("If-Match"))
+	meta, err := s.f.UpdateArtifact(req.PathValue("guid"), patch, ifMatch(req))
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	w.Header().Set("ETag", meta.ETag)
+	setETag(w, meta.ETag)
 	writeJSON(w, http.StatusOK, map[string]any{"meta": meta})
 }
 
-func (s *Server) delete(w http.ResponseWriter, req *http.Request) {
+func (s *Server) delete(w http.ResponseWriter, req *http.Request, kind string) {
+	if _, err := s.metaOfKind(req.PathValue("guid"), kind); err != nil {
+		writeErr(w, err)
+		return
+	}
 	if err := s.f.DeleteArtifact(req.PathValue("guid")); err != nil {
 		writeErr(w, err)
 		return
@@ -231,7 +306,11 @@ func (s *Server) artifactLinks(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	in, out := s.f.Links(guid)
+	in, out, err := s.f.Links(guid)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"incoming": in, "outgoing": out})
 }
 
@@ -241,11 +320,19 @@ func (s *Server) artifactComments(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	comments := []any{}
-	for _, m := range s.f.Comments(guid) {
-		if _, obj, err := s.f.Artifact(m.GUID); err == nil {
-			comments = append(comments, obj)
-		}
+	metas, err := s.f.Comments(guid)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	objs, err := s.f.Objects(metas) // one batch read, ordered like metas
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	comments := make([]map[string]any, 0, len(objs))
+	for i, obj := range objs {
+		comments = append(comments, map[string]any{"meta": metas[i], "data": obj})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"comments": comments})
 }
@@ -282,7 +369,12 @@ func (s *Server) transition(w http.ResponseWriter, req *http.Request) {
 // ---- configuration ----
 
 func (s *Server) schemas(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"schemas": s.f.Schemas()})
+	schemas, err := s.f.Schemas()
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"schemas": schemas})
 }
 
 func (s *Server) effectiveSchema(w http.ResponseWriter, req *http.Request) {

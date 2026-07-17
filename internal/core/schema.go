@@ -7,15 +7,15 @@ import "strings"
 // traversing the repository hierarchy from root to artifact (lexical
 // inheritance, nearest definition wins).
 type Schema struct {
-	ArtifactType string         `json:"artifactType"`
-	Kind         string         `json:"kind,omitempty"`
-	DisplayName  string         `json:"displayName,omitempty"`
-	Inheritance  string         `json:"inheritance,omitempty"` // "off" stops composition
-	HIDPrefix    string         `json:"hidPrefix,omitempty"`
-	Fields       []Field        `json:"fields,omitempty"`
-	Workflows    []string       `json:"workflows,omitempty"`
+	ArtifactType  string         `json:"artifactType"`
+	Kind          string         `json:"kind,omitempty"`
+	DisplayName   string         `json:"displayName,omitempty"`
+	Inheritance   string         `json:"inheritance,omitempty"` // "off" stops composition
+	HIDPrefix     string         `json:"hidPrefix,omitempty"`
+	Fields        []Field        `json:"fields,omitempty"`
+	Workflows     []string       `json:"workflows,omitempty"`
 	Relationships []Relationship `json:"relationships,omitempty"`
-	Presentation map[string]any `json:"presentation,omitempty"`
+	Presentation  map[string]any `json:"presentation,omitempty"`
 }
 
 type Field struct {

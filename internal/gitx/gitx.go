@@ -2,13 +2,16 @@
 //
 // Git is the authoritative store. Commits are constructed without a working
 // directory (hash-object, update-index against a private index file,
-// write-tree, commit-tree) and published with a compare-and-swap update-ref,
-// retrying on concurrent updates.
+// write-tree, commit-tree) and published with a compare-and-swap update-ref.
+// CommitOnce publishes exactly once against an expected parent and reports
+// ErrStale on contention — the retry policy lives in the caller, which must
+// re-validate against the new head before retrying (design guide §10.1).
 package gitx
 
 import (
 	"bytes"
 	"crypto/sha1"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,6 +20,9 @@ import (
 )
 
 const Branch = "refs/heads/main"
+
+// ErrStale reports that the branch moved past the expected parent revision.
+var ErrStale = errors.New("branch moved: stale parent revision")
 
 type Repo struct {
 	Dir string
@@ -35,6 +41,13 @@ type TreeEntry struct {
 	SHA  string
 }
 
+// LogEntry is one commit touching a path: hash, author date (ISO), subject.
+type LogEntry struct {
+	Hash    string `json:"hash"`
+	Date    string `json:"date"`
+	Subject string `json:"subject"`
+}
+
 // Init opens dir as a bare repository, creating it if necessary.
 func Init(dir string) (*Repo, error) {
 	if _, err := os.Stat(filepath.Join(dir, "HEAD")); os.IsNotExist(err) {
@@ -49,13 +62,22 @@ func Init(dir string) (*Repo, error) {
 	return &Repo{Dir: dir}, nil
 }
 
-func (r *Repo) git(stdin []byte, args ...string) ([]byte, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Env = append(os.Environ(),
+func (r *Repo) env() []string {
+	return append(os.Environ(),
 		"GIT_DIR="+r.Dir,
 		"GIT_AUTHOR_NAME=origoa", "GIT_AUTHOR_EMAIL=origoa@localhost",
 		"GIT_COMMITTER_NAME=origoa", "GIT_COMMITTER_EMAIL=origoa@localhost",
 	)
+}
+
+// run executes git; stderr is captured for errors and the raw *exec.ExitError
+// is preserved in the error chain so callers can inspect exit codes.
+// core.quotepath=false keeps non-ASCII paths literal in all output — quoted
+// paths would silently corrupt move/delete ops built from listings.
+func (r *Repo) run(stdin []byte, extraEnv []string, args ...string) ([]byte, error) {
+	args = append([]string{"-c", "core.quotepath=false"}, args...)
+	cmd := exec.Command("git", args...)
+	cmd.Env = append(r.env(), extraEnv...)
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
@@ -63,33 +85,40 @@ func (r *Repo) git(stdin []byte, args ...string) ([]byte, error) {
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("git %s: %v: %s", args[0], err, errb.String())
+		return nil, fmt.Errorf("git %s: %w: %s", args[2], err, strings.TrimSpace(errb.String()))
 	}
 	return out.Bytes(), nil
 }
 
-// Head returns the current commit of the main branch, or "" if unborn.
+func (r *Repo) git(stdin []byte, args ...string) ([]byte, error) {
+	return r.run(stdin, nil, args...)
+}
+
+// Head returns the current commit of the main branch, or "" if the branch is
+// unborn. Other failures (I/O, corruption, resource exhaustion) are real
+// errors — they must never be mistaken for an empty repository, or the
+// projection would happily rebuild itself empty.
 func (r *Repo) Head() (string, error) {
 	out, err := r.git(nil, "rev-parse", "--verify", "--quiet", Branch)
 	if err != nil {
-		return "", nil // unborn branch
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() == 1 {
+			return "", nil // --verify --quiet exits 1 iff the ref does not resolve
+		}
+		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
 }
 
-// ReadBlob returns the content of path at rev.
-func (r *Repo) ReadBlob(rev, path string) ([]byte, error) {
-	return r.git(nil, "cat-file", "blob", rev+":"+path)
-}
-
 // ListTree returns every blob under prefix ("" for the whole tree) at rev.
+// The prefix is matched literally — no pathspec magic or wildcards.
 func (r *Repo) ListTree(rev, prefix string) ([]TreeEntry, error) {
 	if rev == "" {
 		return nil, nil
 	}
 	args := []string{"ls-tree", "-r", "-z", "--format=%(objectname) %(path)", rev}
 	if prefix != "" {
-		args = append(args, "--", prefix)
+		args = append(args, "--", ":(literal)"+prefix)
 	}
 	out, err := r.git(nil, args...)
 	if err != nil {
@@ -146,22 +175,16 @@ func (r *Repo) ReadBlobs(shas []string) (map[string][]byte, error) {
 	return res, nil
 }
 
-// Log returns commit history for path (whole repo if path == "").
-// Each entry is hash, author date (ISO), subject.
-type LogEntry struct {
-	Hash    string `json:"hash"`
-	Date    string `json:"date"`
-	Subject string `json:"subject"`
-}
-
-func (r *Repo) Log(path string, limit int) ([]LogEntry, error) {
+// Log returns commit history for a pathspec (whole repo if empty). The
+// caller supplies any pathspec magic (e.g. ":(glob)**/<guid>/**").
+func (r *Repo) Log(pathspec string, limit int) ([]LogEntry, error) {
 	head, err := r.Head()
 	if err != nil || head == "" {
 		return nil, err
 	}
 	args := []string{"log", fmt.Sprintf("--max-count=%d", limit), "--format=%H%x1f%aI%x1f%s%x1e", head}
-	if path != "" {
-		args = append(args, "--", path)
+	if pathspec != "" {
+		args = append(args, "--", pathspec)
 	}
 	out, err := r.git(nil, args...)
 	if err != nil {
@@ -190,95 +213,93 @@ func BlobSHA(content []byte) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-// Commit applies ops on top of the current branch head and publishes the
-// result with a compare-and-swap ref update. On a concurrent update it
-// rebuilds the commit on the new head and retries.
+// Commit publishes ops with blind CAS retry on contention. Only safe when
+// the ops carry no cross-commit invariants (tooling, tests, simulated
+// foreign writers) — server writes go through the Foundation's validated
+// retry loop, which re-checks preconditions against the new head instead.
 func (r *Repo) Commit(message string, ops []Op) (string, error) {
 	for attempt := 0; attempt < 8; attempt++ {
 		head, err := r.Head()
 		if err != nil {
 			return "", err
 		}
-		commit, err := r.buildCommit(head, message, ops)
-		if err != nil {
-			return "", err
+		commit, err := r.CommitOnce(head, message, ops)
+		if errors.Is(err, ErrStale) {
+			continue
 		}
-		// CAS publish: old value "" asserts the ref must not exist yet.
-		var casErr error
-		if head == "" {
-			_, casErr = r.git(nil, "update-ref", Branch, commit, "")
-		} else {
-			_, casErr = r.git(nil, "update-ref", Branch, commit, head)
-		}
-		if casErr == nil {
-			return commit, nil
-		}
+		return commit, err
 	}
 	return "", fmt.Errorf("gitx: commit failed after retries (concurrent updates)")
 }
 
-func (r *Repo) buildCommit(head, message string, ops []Op) (string, error) {
+// CommitOnce builds ops on top of parent ("" for an unborn branch) and
+// publishes with one compare-and-swap update-ref. If the branch has moved
+// past parent it returns ErrStale and publishes nothing — the caller must
+// resynchronize, re-validate, and rebuild its ops before trying again.
+func (r *Repo) CommitOnce(parent, message string, ops []Op) (string, error) {
+	commit, err := r.buildCommit(parent, message, ops)
+	if err != nil {
+		return "", err
+	}
+	// CAS publish: old value "" asserts the ref must not exist yet.
+	_, casErr := r.git(nil, "update-ref", Branch, commit, parent)
+	if casErr == nil {
+		return commit, nil
+	}
+	// Distinguish contention from real failures (permissions, disk, ...).
+	if now, herr := r.Head(); herr == nil && now != parent {
+		return "", fmt.Errorf("%w (expected %.12s, found %.12s)", ErrStale, parent, now)
+	}
+	return "", casErr
+}
+
+func (r *Repo) buildCommit(parent, message string, ops []Op) (string, error) {
 	idx, err := os.CreateTemp("", "origoa-index-*")
 	if err != nil {
 		return "", err
 	}
 	idx.Close()
 	defer os.Remove(idx.Name())
-	withIdx := func(stdin []byte, args ...string) ([]byte, error) {
-		cmd := exec.Command("git", args...)
-		cmd.Env = append(os.Environ(),
-			"GIT_DIR="+r.Dir, "GIT_INDEX_FILE="+idx.Name(),
-			"GIT_AUTHOR_NAME=origoa", "GIT_AUTHOR_EMAIL=origoa@localhost",
-			"GIT_COMMITTER_NAME=origoa", "GIT_COMMITTER_EMAIL=origoa@localhost",
-		)
-		if stdin != nil {
-			cmd.Stdin = bytes.NewReader(stdin)
-		}
-		var out, errb bytes.Buffer
-		cmd.Stdout = &out
-		cmd.Stderr = &errb
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("git %s: %v: %s", args[0], err, errb.String())
-		}
-		return out.Bytes(), nil
-	}
+	idxEnv := []string{"GIT_INDEX_FILE=" + idx.Name()}
 
-	if head != "" {
-		if _, err := withIdx(nil, "read-tree", head); err != nil {
+	if parent != "" {
+		if _, err := r.run(nil, idxEnv, "read-tree", parent); err != nil {
 			return "", err
 		}
 	} else {
-		if _, err := withIdx(nil, "read-tree", "--empty"); err != nil {
+		if _, err := r.run(nil, idxEnv, "read-tree", "--empty"); err != nil {
 			return "", err
 		}
 	}
+	// All index mutations go through one NUL-terminated --index-info stream:
+	// mode 0 removes an entry, mode 100644 adds/replaces one. NUL termination
+	// makes every legal filename safe, including newlines.
+	var info bytes.Buffer
 	for _, op := range ops {
 		if op.Delete {
-			// Mode 0 via --index-info removes the entry; works without a work tree.
-			line := fmt.Sprintf("0 %040d\t%s\n", 0, op.Path)
-			if _, err := withIdx([]byte(line), "update-index", "--index-info"); err != nil {
-				return "", err
-			}
+			fmt.Fprintf(&info, "0 %040d\t%s\x00", 0, op.Path)
 			continue
 		}
-		sha, err := withIdx(op.Content, "hash-object", "-w", "--stdin")
+		sha, err := r.git(op.Content, "hash-object", "-w", "--stdin")
 		if err != nil {
 			return "", err
 		}
-		info := fmt.Sprintf("100644,%s,%s", strings.TrimSpace(string(sha)), op.Path)
-		if _, err := withIdx(nil, "update-index", "--add", "--cacheinfo", info); err != nil {
+		fmt.Fprintf(&info, "100644 %s 0\t%s\x00", strings.TrimSpace(string(sha)), op.Path)
+	}
+	if info.Len() > 0 {
+		if _, err := r.run(info.Bytes(), idxEnv, "update-index", "-z", "--index-info"); err != nil {
 			return "", err
 		}
 	}
-	tree, err := withIdx(nil, "write-tree")
+	tree, err := r.run(nil, idxEnv, "write-tree")
 	if err != nil {
 		return "", err
 	}
 	args := []string{"commit-tree", strings.TrimSpace(string(tree)), "-m", message}
-	if head != "" {
-		args = append(args, "-p", head)
+	if parent != "" {
+		args = append(args, "-p", parent)
 	}
-	commit, err := withIdx(nil, args...)
+	commit, err := r.git(nil, args...)
 	if err != nil {
 		return "", err
 	}

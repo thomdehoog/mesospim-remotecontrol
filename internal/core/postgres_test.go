@@ -54,7 +54,7 @@ func TestPostgresFastStartAndRecovery(t *testing.T) {
 	if fm.Title != "foreign" || fm.Folder != "manual" {
 		t.Fatalf("foreign artifact not projected: %+v", fm)
 	}
-	if len(f3.Search("foreign", "", "")) != 1 {
+	if len(mustSearch(t, f3, "foreign")) != 1 {
 		t.Fatal("full-text index not rebuilt")
 	}
 }

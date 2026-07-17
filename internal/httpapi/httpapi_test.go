@@ -102,13 +102,13 @@ func TestEndToEnd(t *testing.T) {
 		"id": "dev", "initial": "open", "states": []string{"open", "done"},
 		"transitions": []map[string]string{{"from": "open", "to": "done"}},
 	}, 200)
-	c.must("PUT", "/api/schemas/req", map[string]any{
+	c.must("PUT", "/api/schemas/requirement", map[string]any{
 		"artifactType": "requirement", "kind": "entry", "hidPrefix": "REQ",
 		"fields":        []map[string]any{{"id": "priority", "type": "text"}},
 		"workflows":     []string{"dev"},
 		"relationships": []map[string]any{{"linkType": "verifies", "targetTypes": []string{"testcase"}}},
 	}, 200)
-	c.must("PUT", "/api/schemas/tc", map[string]any{"artifactType": "testcase"}, 200)
+	c.must("PUT", "/api/schemas/testcase", map[string]any{"artifactType": "testcase"}, 200)
 
 	// Entry lifecycle.
 	req1 := c.must("POST", "/api/entries", map[string]any{
@@ -246,7 +246,7 @@ func TestAdversarial(t *testing.T) {
 		if status, _ := c.do("PUT", "/api/entries/"+g, map[string]any{"title": "v2"}, map[string]string{"If-Match": etag}); status != 200 {
 			t.Fatal("fresh If-Match rejected")
 		}
-		if status, _ := c.do("PUT", "/api/entries/"+g, map[string]any{"title": "v3"}, map[string]string{"If-Match": etag}); status != 409 {
+		if status, _ := c.do("PUT", "/api/entries/"+g, map[string]any{"title": "v3"}, map[string]string{"If-Match": etag}); status != 412 {
 			t.Fatal("stale If-Match accepted")
 		}
 	})
@@ -267,7 +267,7 @@ func TestAdversarial(t *testing.T) {
 	t.Run("schema-constrained link types enforced", func(t *testing.T) {
 		c := &client{t: t, srv: c.srv} // rebind failures to this subtest
 		c.must("PUT", "/api/schemas/strict", map[string]any{
-			"artifactType": "strict",
+			"artifactType":  "strict",
 			"relationships": []map[string]any{{"linkType": "only", "targetTypes": []string{"strict"}}},
 		}, 200)
 		a := guidOf(c.must("POST", "/api/entries", map[string]any{"type": "strict"}, 201))

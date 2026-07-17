@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/thomdehoog/origoa/internal/core"
 	"github.com/thomdehoog/origoa/internal/httpapi"
@@ -40,6 +41,14 @@ func main() {
 		mux.Handle("/", http.FileServer(http.Dir(*web)))
 	}
 
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	log.Printf("listening on http://%s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, mux))
+	log.Fatal(srv.ListenAndServe())
 }

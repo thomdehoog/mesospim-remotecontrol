@@ -52,7 +52,7 @@ export class OrigoaApp extends LitElement {
   @state() private data?: Record<string, unknown>;
   @state() private schema?: Schema;
   @state() private workflowDefs: Record<string, Workflow> = {};
-  @state() private comments: Record<string, unknown>[] = [];
+  @state() private comments: { meta: Meta; data: Record<string, unknown> }[] = [];
   @state() private etag = '';
   @state() private query = '';
   @state() private error = '';
@@ -87,11 +87,11 @@ export class OrigoaApp extends LitElement {
       this.etag = res.meta.etag;
       this.schema = undefined;
       this.workflowDefs = {};
-      this.comments = (await api<{ comments: Record<string, unknown>[] }>(`/api/artifacts/${m.guid}/comments`)).comments;
+      this.comments = (await api<{ comments: { meta: Meta; data: Record<string, unknown> }[] }>(`/api/artifacts/${m.guid}/comments`)).comments;
       try {
         this.schema = (await api<{ schema: Schema }>(`/api/schemas/effective?type=${encodeURIComponent(m.type)}&path=${encodeURIComponent(m.folder)}`)).schema;
         for (const id of this.schema?.workflows ?? []) {
-          this.workflowDefs = { ...this.workflowDefs, [id]: (await api<{ workflow: Workflow }>(`/api/workflows/${id}?path=${encodeURIComponent(m.folder)}`)).workflow };
+          this.workflowDefs = { ...this.workflowDefs, [id]: (await api<{ workflow: Workflow }>(`/api/workflows/${encodeURIComponent(id)}?path=${encodeURIComponent(m.folder)}`)).workflow };
         }
       } catch { /* untyped artifact: render raw fields */ }
       this.error = '';
@@ -102,8 +102,24 @@ export class OrigoaApp extends LitElement {
     e.preventDefault();
     if (!this.selected) return;
     const form = new FormData(e.target as HTMLFormElement);
-    const fields: Record<string, string> = {};
-    for (const [k, v] of form.entries()) if (k.startsWith('f:')) fields[k.slice(2)] = String(v);
+    // Merge into the stored fields — never drop properties this client does
+    // not render (the backend preserves them; so must we).
+    const fields = { ...((this.data?.fields ?? {}) as Record<string, unknown>) };
+    const types = new Map((this.schema?.fields ?? []).map(f => [f.id, f.type]));
+    for (const [k, v] of form.entries()) {
+      if (!k.startsWith('f:')) continue;
+      const id = k.slice(2);
+      const str = String(v);
+      const prev = fields[id];
+      if (types.get(id) === 'number' || typeof prev === 'number') {
+        const n = Number(str);
+        fields[id] = Number.isFinite(n) && str.trim() !== '' ? n : str;
+      } else if (typeof prev === 'boolean') {
+        fields[id] = str === 'true';
+      } else {
+        fields[id] = str;
+      }
+    }
     try {
       await api(`/api/${this.selected.kind === 'document' ? 'documents' : 'entries'}/${this.selected.guid}`, {
         method: 'PUT',
@@ -200,7 +216,7 @@ export class OrigoaApp extends LitElement {
       </form>
       <div class="comments">
         <label class="muted">Comments</label>
-        ${this.comments.map(c => html`<div class="comment"><span class="muted">${c.author ?? 'anonymous'} · ${c.created}</span><br>${c.text}</div>`)}
+        ${this.comments.map(c => html`<div class="comment"><span class="muted">${c.data.author ?? 'anonymous'} · ${c.data.created}</span><br>${c.data.text}</div>`)}
         <form @submit=${this.comment}>
           <input name="text" placeholder="Add a comment…">
         </form>

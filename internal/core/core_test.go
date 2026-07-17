@@ -84,11 +84,11 @@ func TestCleanFolder(t *testing.T) {
 
 func TestSchemaComposition(t *testing.T) {
 	f := testFoundation(t)
-	must(t, f.PutSchema("", "req", &Schema{
+	must(t, f.PutSchema("", "requirement", &Schema{
 		ArtifactType: "requirement", Kind: KindEntry, HIDPrefix: "REQ",
 		Fields: []Field{{ID: "priority", Type: "enum", Options: []string{"low", "high"}}, {ID: "owner", Type: "text"}},
 	}))
-	must(t, f.PutSchema("proj", "req", &Schema{
+	must(t, f.PutSchema("proj", "requirement", &Schema{
 		ArtifactType: "requirement",
 		Fields:       []Field{{ID: "priority", Type: "enum", Options: []string{"p1", "p2", "p3"}}, {ID: "cost", Type: "number"}},
 	}))
@@ -107,7 +107,7 @@ func TestSchemaComposition(t *testing.T) {
 	}
 
 	// inheritance: off severs everything above.
-	must(t, f.PutSchema("island", "req", &Schema{
+	must(t, f.PutSchema("island", "requirement", &Schema{
 		ArtifactType: "requirement", Inheritance: "off",
 		Fields: []Field{{ID: "only", Type: "text"}},
 	}))
@@ -129,7 +129,7 @@ func TestSchemaComposition(t *testing.T) {
 
 func TestHIDGenerationAndUniqueness(t *testing.T) {
 	f := testFoundation(t)
-	must(t, f.PutSchema("", "req", &Schema{ArtifactType: "requirement", HIDPrefix: "REQ"}))
+	must(t, f.PutSchema("", "requirement", &Schema{ArtifactType: "requirement", HIDPrefix: "REQ"}))
 
 	m1, err := f.CreateArtifact(KindEntry, "", "requirement", body(t, `{"title":"one"}`))
 	must(t, err)
@@ -235,12 +235,13 @@ func TestMoveKeepsIdentityAndLinks(t *testing.T) {
 	if moved.Folder != "dst/deep" || moved.GUID != a.GUID {
 		t.Fatalf("moved meta = %+v", moved)
 	}
-	in, out := f.Links(a.GUID)
+	in, out, lerr := f.Links(a.GUID)
+	must(t, lerr)
 	if len(out) != 1 || out[0].GUID != l.GUID || len(in) != 0 {
 		t.Fatalf("links after move: in=%v out=%v", in, out)
 	}
 	// Old location is gone.
-	for _, m := range f.List("", "", "src", false) {
+	for _, m := range mustList(t, f, "", "", "src", false) {
 		if m.GUID == a.GUID {
 			t.Fatal("artifact still listed in old folder")
 		}
@@ -251,7 +252,7 @@ func TestRebuildFromGitAlone(t *testing.T) {
 	dir := t.TempDir() + "/repo.git"
 	f, err := openTest(t, dir)
 	must(t, err)
-	must(t, f.PutSchema("", "req", &Schema{ArtifactType: "requirement", HIDPrefix: "REQ"}))
+	must(t, f.PutSchema("", "requirement", &Schema{ArtifactType: "requirement", HIDPrefix: "REQ"}))
 	m, err := f.CreateArtifact(KindEntry, "a/b", "requirement", body(t, `{"title":"persisted"}`))
 	must(t, err)
 	c, err := f.CreateComment(m.GUID, "note", "", "tester")
@@ -267,10 +268,10 @@ func TestRebuildFromGitAlone(t *testing.T) {
 	if m2.Title != "persisted" || m2.HID != m.HID || m2.Folder != "a/b" {
 		t.Fatalf("rebuilt meta = %+v", m2)
 	}
-	if cs := f2.Comments(m.GUID); len(cs) != 1 || cs[0].GUID != c.GUID {
+	if cs := mustComments(t, f2, m.GUID); len(cs) != 1 || cs[0].GUID != c.GUID {
 		t.Fatalf("rebuilt comments = %v", cs)
 	}
-	if len(f2.Search("persisted", "", "")) != 1 {
+	if len(mustSearch(t, f2, "persisted")) != 1 {
 		t.Fatal("search index not rebuilt")
 	}
 }
@@ -280,4 +281,25 @@ func must(t *testing.T, err error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func mustList(t *testing.T, f *Foundation, kind, typ, folder string, subtree bool) []*Meta {
+	t.Helper()
+	metas, err := f.List(kind, typ, folder, subtree, 0)
+	must(t, err)
+	return metas
+}
+
+func mustSearch(t *testing.T, f *Foundation, q string) []*Meta {
+	t.Helper()
+	metas, err := f.Search(q, "", "", 0)
+	must(t, err)
+	return metas
+}
+
+func mustComments(t *testing.T, f *Foundation, guid string) []*Meta {
+	t.Helper()
+	metas, err := f.Comments(guid)
+	must(t, err)
+	return metas
 }

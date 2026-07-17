@@ -24,9 +24,13 @@ func TestCommitReadDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := r.ReadBlob(c1, "dir/a.json")
-	if err != nil || string(got) != `{"a":1}` {
-		t.Fatalf("ReadBlob = %q, %v", got, err)
+	entries1, err := r.ListTree(c1, "")
+	if err != nil || len(entries1) != 1 {
+		t.Fatalf("ListTree = %v, %v", entries1, err)
+	}
+	blobs, err := r.ReadBlobs([]string{entries1[0].SHA})
+	if err != nil || string(blobs[entries1[0].SHA]) != `{"a":1}` {
+		t.Fatalf("ReadBlobs = %q, %v", blobs, err)
 	}
 	if _, err := r.Commit("del a", []Op{{Path: "dir/a.json", Delete: true}}); err != nil {
 		t.Fatal(err)
