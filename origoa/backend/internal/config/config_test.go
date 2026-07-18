@@ -57,7 +57,7 @@ func TestLoadMissingFileErrors(t *testing.T) {
 
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"ORIGOA_LISTEN", "ORIGOA_GIT_DIR", "ORIGOA_DSN", "ORIGOA_STATIC"} {
+	for _, k := range []string{"ORIGOA_LISTEN", "ORIGOA_GIT_DIR", "ORIGOA_DSN", "ORIGOA_STATIC", "ORIGOA_CORS_ORIGIN"} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
 	}

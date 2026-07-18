@@ -9,6 +9,7 @@ import (
 	"log"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"origoa/internal/api"
 	"origoa/internal/config"
@@ -30,13 +31,22 @@ func main() {
 		log.Fatal(err)
 	}
 
+	cors := cfg.CORSOrigin
+	if cors == "" {
+		cors = "same-origin only"
+	}
+	log.Printf("origoa: config — listen=%s gitDir=%s static=%q cors=%s database=%s",
+		cfg.Listen, cfg.GitDir, cfg.StaticDir, cors, cfg.RedactedDatabase())
+
 	git, err := gitstore.Open(cfg.GitDir)
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("origoa: git repository at %s", cfg.GitDir)
 
-	db, err := projection.Connect(ctx, cfg.Database)
+	// Retry the database connection at startup so the backend can come up
+	// alongside a database that is still initializing (e.g. under compose).
+	db, err := projection.ConnectWithRetry(ctx, cfg.Database, 60*time.Second)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -58,7 +68,7 @@ func main() {
 	}
 	log.Printf("origoa: projection synchronized")
 
-	server := api.NewServer(svc, cfg.StaticDir)
+	server := api.NewServer(svc, cfg.StaticDir, cfg.CORSOrigin)
 	if err := server.Serve(ctx, cfg.Listen); err != nil {
 		log.Fatal(err)
 	}

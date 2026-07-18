@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -18,6 +20,9 @@ import (
 type Hub struct {
 	mu      sync.Mutex
 	clients map[*client]bool
+	// corsOrigin, when set, is an additional cross-origin allowed to open a
+	// session (mirrors the REST CORS setting for the split-origin dev setup).
+	corsOrigin string
 }
 
 type client struct {
@@ -28,20 +33,38 @@ type client struct {
 	editing bool
 }
 
-// NewHub creates the session hub.
-func NewHub() *Hub {
-	return &Hub{clients: map[*client]bool{}}
+// NewHub creates the session hub. corsOrigin is the extra cross-origin (if
+// any) allowed to connect, matching the REST CORS configuration.
+func NewHub(corsOrigin string) *Hub {
+	return &Hub{clients: map[*client]bool{}, corsOrigin: corsOrigin}
 }
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	// The API is same-origin in production and CORS-open in development.
-	CheckOrigin: func(r *http.Request) bool { return true },
+// checkOrigin rejects cross-site WebSocket connections (CSWSH): a browser
+// request with an Origin header is accepted only when it is same-origin, or
+// matches the explicitly configured cross-origin. Non-browser clients (no
+// Origin header) are allowed.
+func (h *Hub) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	if h.corsOrigin == "*" || (h.corsOrigin != "" && origin == h.corsOrigin) {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
 }
 
 // HandleWS upgrades the connection and joins the session service.
 func (h *Hub) HandleWS(w http.ResponseWriter, r *http.Request) {
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin:     h.checkOrigin,
+	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return

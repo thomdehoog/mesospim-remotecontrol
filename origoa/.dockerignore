@@ -1,0 +1,9 @@
+# Keep the build context small and reproducible.
+**/node_modules
+**/dist
+**/data
+frontend/test
+backend/**/*_test.go
+backend/internal/**/testdata
+*.md
+.git

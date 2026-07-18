@@ -11,8 +11,10 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"log"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
@@ -38,6 +40,32 @@ func Connect(ctx context.Context, dsn string) (*DB, error) {
 		return nil, fmt.Errorf("projection: apply schema: %w", err)
 	}
 	return &DB{Pool: pool}, nil
+}
+
+// ConnectWithRetry is Connect with a bounded startup retry, so the backend
+// can start alongside a database that is still coming up (for example under
+// container orchestration) instead of crashing on the first refused
+// connection. It gives up when ctx is cancelled or the deadline passes.
+func ConnectWithRetry(ctx context.Context, dsn string, timeout time.Duration) (*DB, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		db, err := Connect(ctx, dsn)
+		if err == nil {
+			return db, nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return nil, fmt.Errorf("projection: database not reachable after %s: %w", timeout, lastErr)
+		}
+		wait := time.Duration(min(attempt+1, 5)) * time.Second
+		log.Printf("projection: database not ready (%v); retrying in %s", err, wait)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
 }
 
 // Close releases the pool.

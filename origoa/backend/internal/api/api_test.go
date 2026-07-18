@@ -63,7 +63,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(NewServer(svc, "").Handler())
+	ts := httptest.NewServer(NewServer(svc, "", "").Handler())
 	t.Cleanup(ts.Close)
 	return ts
 }

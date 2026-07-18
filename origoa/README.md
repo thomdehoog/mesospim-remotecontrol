@@ -76,26 +76,29 @@ handling.
 
 ## Running it
 
-Requirements: Go ≥ 1.24, Node ≥ 20, PostgreSQL ≥ 14 with the `ltree`
-extension, and a database (default DSN
-`postgres://origoa:origoa@localhost:5432/origoa`).
+The fastest path is Docker — from `origoa/`:
 
 ```bash
-# database (once)
-createuser origoa; createdb -O origoa origoa
-psql -d origoa -c 'CREATE EXTENSION IF NOT EXISTS ltree'
-
-# frontend build
-cd frontend && npm install && npm run build
-
-# demo data + server
-cd ../backend
-go run ./cmd/origoa-seed                      # populates an empty repository
-ORIGOA_STATIC=../frontend/dist go run ./cmd/origoad   # http://localhost:8000
+docker compose up -d db                       # PostgreSQL
+docker compose run --rm backend origoa-seed   # optional demo data
+docker compose up -d --build backend          # API + UI on http://localhost:8000
 ```
 
-Environment overrides: `ORIGOA_DSN`, `ORIGOA_GIT_DIR`, `ORIGOA_LISTEN`,
-`ORIGOA_STATIC`; or pass `-config origoa.json`.
+Or manually (Go ≥ 1.24, Node ≥ 20, PostgreSQL with `ltree`):
+
+```bash
+createdb -O origoa origoa && psql -d origoa -c 'CREATE EXTENSION IF NOT EXISTS ltree'
+cd frontend && npm install && npm run build && cd ../backend
+go run ./cmd/origoa-seed                                # optional demo data
+ORIGOA_STATIC=../frontend/dist go run ./cmd/origoad     # http://localhost:8000
+```
+
+`make help` lists shortcuts for both. **[SETUP.md](SETUP.md)** is the full,
+step-by-step tutorial — Docker and manual, development mode, the configuration
+reference, and the production and security guidance. Read
+[§7 Security posture](SETUP.md#7-security-posture-read-before-exposing-it)
+before exposing the service: the MVP has no built-in authentication and must
+sit behind an auth gateway and TLS when running anywhere untrusted.
 
 ## Tests
 

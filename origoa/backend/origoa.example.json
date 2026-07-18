@@ -1,0 +1,16 @@
+{
+  "listen": ":8000",
+  "gitDir": "./data/repo.git",
+  "database": "postgres://origoa:origoa@localhost:5432/origoa?sslmode=disable",
+  "staticDir": "../frontend/dist",
+  "corsOrigin": "",
+  "author": {
+    "name": "origoa",
+    "email": "origoa@localhost"
+  },
+  "scanner": {
+    "guid_files": [".origoa.json"],
+    "config_folders": [".origoa"],
+    "indexers": ["foundation"]
+  }
+}

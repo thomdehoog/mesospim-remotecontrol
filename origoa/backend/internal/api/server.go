@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"origoa/internal/projection"
 	"origoa/internal/repo"
@@ -29,13 +30,18 @@ type Server struct {
 
 	// StaticDir optionally serves the frontend build (SPA fallback).
 	StaticDir string
+
+	// CORSOrigin enables cross-origin requests from the given origin ("*"
+	// for any). Empty disables CORS entirely, which is correct for the
+	// production topology where the API serves the SPA same-origin.
+	CORSOrigin string
 }
 
 // NewServer creates the API server and connects the event hub.
-func NewServer(svc *repo.Service, staticDir string) *Server {
-	hub := NewHub()
+func NewServer(svc *repo.Service, staticDir, corsOrigin string) *Server {
+	hub := NewHub(corsOrigin)
 	svc.EventSink = func(e repo.Event) { hub.BroadcastEvent(e) }
-	return &Server{Svc: svc, Hub: hub, StaticDir: staticDir}
+	return &Server{Svc: svc, Hub: hub, StaticDir: staticDir, CORSOrigin: corsOrigin}
 }
 
 // Handler builds the route table.
@@ -78,12 +84,57 @@ func (s *Server) Handler() http.Handler {
 	if s.StaticDir != "" {
 		mux.HandleFunc("/", s.handleStatic)
 	}
-	return withCORS(mux)
+	var h http.Handler = mux
+	if s.CORSOrigin != "" {
+		h = withCORS(h, s.CORSOrigin)
+	}
+	return recoverPanic(securityHeaders(h))
 }
 
-func withCORS(next http.Handler) http.Handler {
+// securityHeaders applies conservative response hardening. The
+// Content-Security-Policy is defense-in-depth behind the HTML sanitizer:
+// scripts and framing are restricted to same-origin, styles allow the inline
+// stylesheet the app ships, and the API/WebSocket connection is same-origin.
+func securityHeaders(next http.Handler) http.Handler {
+	const csp = "default-src 'self'; " +
+		"script-src 'self'; " +
+		"style-src 'self' 'unsafe-inline'; " +
+		"img-src 'self' data: https:; " +
+		"connect-src 'self' ws: wss:; " +
+		"frame-ancestors 'none'; " +
+		"base-uri 'self'; " +
+		"form-action 'self'"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Content-Security-Policy", csp)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// recoverPanic turns a panic in any handler into a clean 500 and a log line,
+// so a single bad request can never take the server down.
+func recoverPanic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if v := recover(); v != nil {
+				log.Printf("api: panic serving %s %s: %v", r.Method, r.URL.Path, v)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"error":"internal error"}`))
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withCORS adds permissive CORS headers for the configured origin. Used for
+// the split-origin development topology (Vite dev server on a different
+// port); production serves the SPA same-origin and needs no CORS.
+func withCORS(next http.Handler, origin string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
@@ -179,12 +230,25 @@ func artifactListJSON(rows []projection.ArtifactRow) []map[string]any {
 	return out
 }
 
-// Serve starts the HTTP server.
+// Serve starts the HTTP server and shuts it down gracefully when ctx is
+// cancelled.
+//
+// ReadHeaderTimeout and IdleTimeout bound slow/idle connections (Slowloris)
+// without a global read/write timeout, which would sever the long-lived
+// WebSocket session connections. Request bodies are separately capped by
+// MaxBytesReader at the handler.
 func (s *Server) Serve(ctx context.Context, addr string) error {
-	srv := &http.Server{Addr: addr, Handler: s.Handler()}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
 		<-ctx.Done()
-		srv.Shutdown(context.Background())
+		shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		srv.Shutdown(shutCtx)
 	}()
 	log.Printf("origoa: listening on %s", addr)
 	err := srv.ListenAndServe()
