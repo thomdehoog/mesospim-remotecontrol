@@ -41,7 +41,7 @@ func TestBuildAndPublish(t *testing.T) {
 		t.Fatal("expected unborn branch")
 	}
 	h1 := commitFiles(t, s, head, "Datapod 1 created", map[string]string{
-		"specs/g1/.origoa.json": `{"guid":"g1"}`,
+		"specs/g1/.origoa.json":          `{"guid":"g1"}`,
 		"specs/.origoa/schemas/req.json": `{"artifactType":"req"}`,
 	})
 	b, ok, err := s.ReadBlob(h1, "specs/g1/.origoa.json")

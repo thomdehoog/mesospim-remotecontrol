@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/jackc/pgx/v5"
@@ -74,9 +76,16 @@ type Service struct {
 	// EventSink receives repository events for the session service.
 	EventSink func(Event)
 
-	// syncMu is the repository synchronization mutex protecting the
-	// Git branch update and database revision tracking.
+	// syncMu is the repository synchronization mutex the spec names: it
+	// protects only the Git branch update and database revision tracking,
+	// minimizing contention between concurrent writers.
 	syncMu sync.Mutex
+
+	// maint implements the spec's Maintenance Mode. Writers hold it shared
+	// (they remain concurrent with one another); a reindex or large
+	// structural operation holds it exclusively, so the repository is
+	// effectively read-only for the duration while ordinary reads continue.
+	maint sync.RWMutex
 
 	maintenance atomic.Bool
 	reindexing  atomic.Bool
@@ -115,12 +124,16 @@ func (s *Service) setProgress(phase, detail string) {
 
 // Sync brings the projection up to date with the current Git HEAD by
 // replaying missing commits. Called at startup and before every update.
+//
+// processed_hash is read before HEAD (see Replay) so a writer advancing the
+// repository between the two reads can only make HEAD newer than the stored
+// hash, never the reverse.
 func (s *Service) Sync(ctx context.Context) error {
-	head, err := s.Git.Head()
+	stored, err := s.DB.ProcessedHash(ctx, nil)
 	if err != nil {
 		return err
 	}
-	stored, err := s.DB.ProcessedHash(ctx, nil)
+	head, err := s.Git.Head()
 	if err != nil {
 		return err
 	}
@@ -132,14 +145,22 @@ func (s *Service) Sync(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if err := s.Scanner.Replay(ctx, tx, head); err != nil {
-		// Incremental replay impossible (e.g. history was rewritten
-		// externally): fall back to a complete rebuild.
-		log.Printf("repo: incremental replay failed (%v); performing full reindex", err)
-		tx.Rollback(ctx)
-		return s.Reindex(ctx)
+	if err := s.Scanner.Replay(ctx, tx); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// SyncOrReindex synchronizes the projection incrementally, falling back to a
+// full reindex when replay is impossible (for example a Git history rewrite).
+// Called at startup, where holding no maintenance lock makes the reindex
+// safe; the in-request write path never triggers a reindex from Sync.
+func (s *Service) SyncOrReindex(ctx context.Context) error {
+	if err := s.Sync(ctx); err != nil {
+		log.Printf("repo: incremental sync failed (%v); performing full reindex", err)
+		return s.Reindex(ctx)
+	}
+	return nil
 }
 
 // BuildFunc constructs the changeset of one logical repository operation
@@ -149,26 +170,40 @@ type BuildFunc func(head plumbing.Hash, cs *gitstore.Changeset) (string, error)
 
 // Update executes the repository update transaction:
 //
-//	1. Check processed_hash against Git HEAD; replay missing commits.
-//	2. Construct the Git commit (plumbing, branch untouched).
-//	3. Begin the PostgreSQL transaction.
-//	4. Update the database projection (excluding processed_hash).
-//	5. Acquire the repository mutex.
-//	6. Publish the Git commit (update-ref compare-and-swap).
-//	   On failure: release mutex, roll back, rebuild, retry.
-//	7. Update processed_hash.
-//	8. Release the repository mutex.
-//	9. Commit the PostgreSQL transaction.
+//  1. Check processed_hash against Git HEAD; replay missing commits.
+//  2. Construct the Git commit (plumbing, branch untouched).
+//  3. Begin the PostgreSQL transaction.
+//  4. Update the database projection (excluding processed_hash).
+//  5. Acquire the repository mutex.
+//  6. Publish the Git commit (update-ref compare-and-swap).
+//     On failure: release mutex, roll back, rebuild, retry.
+//  7. Update processed_hash.
+//  8. Release the repository mutex.
+//  9. Commit the PostgreSQL transaction.
 func (s *Service) Update(ctx context.Context, build BuildFunc) (plumbing.Hash, error) {
 	return s.update(ctx, build, false)
 }
 
-func (s *Service) update(ctx context.Context, build BuildFunc, allowInMaintenance bool) (plumbing.Hash, error) {
-	if s.maintenance.Load() && !allowInMaintenance {
-		return plumbing.ZeroHash, ErrMaintenance
+func (s *Service) update(ctx context.Context, build BuildFunc, exclusiveHeld bool) (plumbing.Hash, error) {
+	// Enter Maintenance Mode as a reader: many writers proceed concurrently,
+	// but a reindex or large structural operation holding the lock
+	// exclusively makes writes return "Temporarily Unavailable". A caller
+	// that already holds the exclusive lock (a large structural operation)
+	// skips this to avoid self-deadlock.
+	if !exclusiveHeld {
+		if !s.maint.TryRLock() {
+			return plumbing.ZeroHash, ErrMaintenance
+		}
+		defer s.maint.RUnlock()
 	}
-	const maxRetries = 8
+	// A branch that moved under a concurrent writer means the transaction is
+	// simply restarted against the new head (spec step 7); the bound is a
+	// livelock backstop, generous relative to any realistic writer count.
+	const maxRetries = 50
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			retryBackoff(attempt)
+		}
 		// (1) synchronize projection with HEAD
 		if err := s.Sync(ctx); err != nil {
 			return plumbing.ZeroHash, err
@@ -239,7 +274,13 @@ func (s *Service) update(ctx context.Context, build BuildFunc, allowInMaintenanc
 		}
 		return newCommit, nil
 	}
-	return plumbing.ZeroHash, fmt.Errorf("repository update failed after retries: %w", gitstore.ErrConcurrentUpdate)
+	return plumbing.ZeroHash, fmt.Errorf("repository update failed after %d retries: %w", maxRetries, gitstore.ErrConcurrentUpdate)
+}
+
+// retryBackoff sleeps for a short, jittered, escalating interval that spreads
+// competing writers apart so they stop colliding on the branch CAS.
+func retryBackoff(attempt int) {
+	time.Sleep(time.Duration(attempt)*2*time.Millisecond + time.Duration(rand.IntN(8))*time.Millisecond)
 }
 
 // Reindex performs a complete repository rebuild from Git:
@@ -257,6 +298,12 @@ func (s *Service) Reindex(ctx context.Context) error {
 		return errors.New("reindex already running")
 	}
 	defer s.reindexing.Store(false)
+
+	// Enter Maintenance Mode exclusively: this waits for every in-flight
+	// writer to finish and blocks new ones, so the rebuild runs against a
+	// stable HEAD with no concurrent projection writes. Reads continue.
+	s.maint.Lock()
+	defer s.maint.Unlock()
 
 	s.maintenance.Store(true)
 	s.emit(Event{Type: "maintenance", Detail: "enabled"})

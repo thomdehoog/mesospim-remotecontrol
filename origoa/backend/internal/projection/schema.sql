@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
     repo_path      text  NOT NULL,             -- storage location (GUID directory or metadata file)
     parent_path    text  NOT NULL DEFAULT '',  -- enclosing folder
     ltpath         ltree NOT NULL,             -- encoded parent_path for subtree queries
-    content        jsonb NOT NULL,
+    content        text  NOT NULL,             -- Git-faithful JSON (text, not jsonb: may carry an escaped NUL)
     updated_commit text  NOT NULL DEFAULT '',
     updated_at     timestamptz NOT NULL DEFAULT now()
 );
@@ -101,6 +101,6 @@ CREATE TABLE IF NOT EXISTS config_objects (
     scope_lt     ltree NOT NULL,
     category     text  NOT NULL,      -- schemas | workflows | ...
     name         text  NOT NULL,
-    content      jsonb NOT NULL
+    content      text  NOT NULL
 );
 CREATE INDEX IF NOT EXISTS config_objects_cat_scope ON config_objects (category, scope_path);

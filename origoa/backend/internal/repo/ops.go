@@ -221,9 +221,9 @@ type UpdateArtifactParams struct {
 	Title      *string         `json:"title,omitempty"`
 	HID        *string         `json:"hid,omitempty"`
 	Base       *string         `json:"base,omitempty"`
-	Fields     map[string]any  `json:"fields,omitempty"`      // merged; null removes a field
-	Sections   json.RawMessage `json:"sections,omitempty"`    // documents: replaces the section tree
-	IfRevision string          `json:"ifRevision,omitempty"`  // optimistic concurrency
+	Fields     map[string]any  `json:"fields,omitempty"`     // merged; null removes a field
+	Sections   json.RawMessage `json:"sections,omitempty"`   // documents: replaces the section tree
+	IfRevision string          `json:"ifRevision,omitempty"` // optimistic concurrency
 }
 
 // UpdateArtifact applies a patch to an entry or document.
@@ -818,12 +818,14 @@ func (s *Service) MoveFolder(ctx context.Context, oldFolder, newFolder string) e
 	if err != nil {
 		return err
 	}
-	inMaintenance := false
-	if impact.Maintenance {
-		if !s.maintenance.CompareAndSwap(false, true) {
-			return ErrMaintenance
-		}
-		inMaintenance = true
+	// A large move enters Maintenance Mode exclusively (draining in-flight
+	// writers and blocking new ones); a small one runs as an ordinary
+	// concurrent writer.
+	exclusive := impact.Maintenance
+	if exclusive {
+		s.maint.Lock()
+		defer s.maint.Unlock()
+		s.maintenance.Store(true)
 		s.emit(Event{Type: "maintenance", Detail: "enabled"})
 		defer func() {
 			s.maintenance.Store(false)
@@ -852,7 +854,7 @@ func (s *Service) MoveFolder(ctx context.Context, oldFolder, newFolder string) e
 		}
 		cs.DeleteDir(from)
 		return fmt.Sprintf("Folder %s moved to %s", from, to), nil
-	}, inMaintenance)
+	}, exclusive)
 	if err == nil {
 		s.emit(Event{Type: "folder-moved", Path: to, Detail: from})
 	}

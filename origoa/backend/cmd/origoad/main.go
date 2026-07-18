@@ -51,8 +51,9 @@ func main() {
 	svc.AuthorName = cfg.Author.Name
 	svc.AuthorEmail = cfg.Author.Email
 
-	// Recovery: replay commits missed while the backend was down.
-	if err := svc.Sync(ctx); err != nil {
+	// Recovery: replay commits missed while the backend was down, rebuilding
+	// from scratch if incremental replay is impossible.
+	if err := svc.SyncOrReindex(ctx); err != nil {
 		log.Fatalf("origoa: startup synchronization failed: %v", err)
 	}
 	log.Printf("origoa: projection synchronized")

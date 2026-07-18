@@ -17,6 +17,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-git/go-git/v5"
@@ -36,9 +37,16 @@ const Branch = "refs/heads/main"
 var ErrConcurrentUpdate = errors.New("gitstore: branch was updated concurrently")
 
 // Store wraps a bare Git repository.
+//
+// go-git is not safe for concurrent use — its object store and object cache
+// mutate on both reads and writes — so every method serializes access to the
+// underlying repository through mu. The store is therefore a thread-safe
+// abstraction over a non-thread-safe library, and callers (concurrent
+// writers, readers and reindexing) need no Git-level locking of their own.
 type Store struct {
 	repo *git.Repository
 	dir  string
+	mu   sync.Mutex
 }
 
 // Open opens (or initializes) a bare repository at dir.
@@ -62,6 +70,13 @@ func (s *Store) Dir() string { return s.dir }
 // Head returns the current commit of the managed branch. A zero hash is
 // returned for an unborn branch.
 func (s *Store) Head() (plumbing.Hash, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.headLocked()
+}
+
+// headLocked reads the branch reference; the caller must hold mu.
+func (s *Store) headLocked() (plumbing.Hash, error) {
 	ref, err := s.repo.Reference(plumbing.ReferenceName(Branch), true)
 	if errors.Is(err, plumbing.ErrReferenceNotFound) {
 		return plumbing.ZeroHash, nil
@@ -74,6 +89,8 @@ func (s *Store) Head() (plumbing.Hash, error) {
 
 // Commit returns the commit object for a hash.
 func (s *Store) Commit(h plumbing.Hash) (*object.Commit, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.repo.CommitObject(h)
 }
 
@@ -83,6 +100,8 @@ func (s *Store) ReadBlob(commit plumbing.Hash, p string) ([]byte, bool, error) {
 	if commit.IsZero() {
 		return nil, false, nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	c, err := s.repo.CommitObject(commit)
 	if err != nil {
 		return nil, false, err
@@ -115,6 +134,8 @@ func (s *Store) ListTree(commit plumbing.Hash, dir string) ([]TreeEntry, error) 
 	if commit.IsZero() {
 		return nil, nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	c, err := s.repo.CommitObject(commit)
 	if err != nil {
 		return nil, err
@@ -144,11 +165,14 @@ func (s *Store) ListTree(commit plumbing.Hash, dir string) ([]TreeEntry, error) 
 // WalkFile is invoked for every file during a full tree walk.
 type WalkFile func(path string, read func() ([]byte, error)) error
 
-// WalkTree traverses every file reachable from the commit.
+// WalkTree traverses every file reachable from the commit. The callback runs
+// while the repository lock is held, so it must not call back into the store.
 func (s *Store) WalkTree(commit plumbing.Hash, fn WalkFile) error {
 	if commit.IsZero() {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	c, err := s.repo.CommitObject(commit)
 	if err != nil {
 		return err
@@ -254,6 +278,8 @@ type nodeEntry struct {
 // The branch reference is NOT updated; the commit exists but is not yet
 // visible in the repository history until PublishCommit succeeds.
 func (s *Store) BuildCommit(parent plumbing.Hash, cs *Changeset, message, authorName, authorEmail string) (plumbing.Hash, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	root := &treeNode{children: map[string]*nodeEntry{}}
 	if !parent.IsZero() {
 		c, err := s.repo.CommitObject(parent)
@@ -435,7 +461,9 @@ func treeSortName(e object.TreeEntry) string {
 // expected old value). ErrConcurrentUpdate is returned when the branch no
 // longer points at expectedOld.
 func (s *Store) PublishCommit(newCommit, expectedOld plumbing.Hash) error {
-	cur, err := s.Head()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.headLocked()
 	if err != nil {
 		return err
 	}
@@ -483,6 +511,13 @@ const (
 // messages are never interpreted: the diff is the only authoritative
 // description of a commit.
 func (s *Store) DiffCommit(h plumbing.Hash) ([]Change, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.diffCommitLocked(h)
+}
+
+// diffCommitLocked is DiffCommit's body; the caller must hold mu.
+func (s *Store) diffCommitLocked(h plumbing.Hash) ([]Change, error) {
 	c, err := s.repo.CommitObject(h)
 	if err != nil {
 		return nil, err
@@ -531,6 +566,8 @@ func (s *Store) CommitsBetween(from, to plumbing.Hash) ([]plumbing.Hash, error) 
 	if to.IsZero() {
 		return nil, nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var chain []plumbing.Hash
 	cur := to
 	for !cur.IsZero() && cur != from {
@@ -569,11 +606,13 @@ func (s *Store) FileHistory(head plumbing.Hash, prefix string, limit int) ([]His
 	if head.IsZero() {
 		return nil, nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	prefix = norm(prefix)
 	var out []HistoryEntry
 	cur := head
 	for !cur.IsZero() && (limit <= 0 || len(out) < limit) {
-		changes, err := s.DiffCommit(cur)
+		changes, err := s.diffCommitLocked(cur)
 		if err != nil {
 			return nil, err
 		}

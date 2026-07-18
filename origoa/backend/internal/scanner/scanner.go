@@ -65,10 +65,10 @@ type PathClass int
 
 // Path classifications.
 const (
-	Irrelevant PathClass = iota
-	ArtifactFile          // a configured GUID file inside a GUID directory
-	ConfigObjectFile      // a file inside a configured configuration folder
-	AttachmentFile        // other file inside a GUID directory
+	Irrelevant       PathClass = iota
+	ArtifactFile               // a configured GUID file inside a GUID directory
+	ConfigObjectFile           // a file inside a configured configuration folder
+	AttachmentFile             // other file inside a GUID directory
 )
 
 // Classified is the result of classifying a repository path.
@@ -85,8 +85,15 @@ type Classified struct {
 	Name      string // file name without extension
 }
 
-// Classify determines what a repository path means to the Foundation.
+// Classify determines what a repository path means to the Foundation. The
+// path is normalized to clean segments first (Git tree paths are already
+// clean, but this keeps classification total for any input).
 func (c Config) Classify(p string) Classified {
+	p = path.Clean("/" + p)
+	p = strings.TrimPrefix(p, "/")
+	if p == "" || p == "." {
+		return Classified{Class: Irrelevant}
+	}
 	segs := strings.Split(p, "/")
 	// Configuration folder?
 	for i, seg := range segs[:len(segs)-1] {
@@ -303,9 +310,14 @@ func (s *Scanner) ProjectTree(ctx context.Context, tx pgx.Tx, commit plumbing.Ha
 }
 
 // Replay projects all commits between the stored processed hash and the
-// given head, updating processed_hash. Used for recovery after crashes,
-// external Git pushes, and interrupted synchronization.
-func (s *Scanner) Replay(ctx context.Context, tx pgx.Tx, head plumbing.Hash) error {
+// current Git head, updating processed_hash. Used for recovery after
+// crashes, external Git pushes, and interrupted synchronization.
+//
+// The stored hash is read before the head: because processed_hash is only
+// committed after the branch reference has already advanced, reading it
+// first guarantees the stored hash is an ancestor of (or equal to) the head
+// read afterwards, even while other writers advance the repository.
+func (s *Scanner) Replay(ctx context.Context, tx pgx.Tx) error {
 	stored, err := s.db.ProcessedHash(ctx, tx)
 	if err != nil {
 		return err
@@ -313,6 +325,10 @@ func (s *Scanner) Replay(ctx context.Context, tx pgx.Tx, head plumbing.Hash) err
 	from := plumbing.ZeroHash
 	if stored != "" {
 		from = plumbing.NewHash(stored)
+	}
+	head, err := s.git.Head()
+	if err != nil {
+		return err
 	}
 	if from == head {
 		return nil

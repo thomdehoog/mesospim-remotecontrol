@@ -59,6 +59,21 @@ pushes from external tooling are picked up by replay; if incremental replay
 is impossible the backend falls back to a full reindex (GUID recognition →
 field indexing → full-text rebuild → history scan for deleted artifacts).
 
+Concurrency follows the spec's two mechanisms. Writers hold the Maintenance
+Mode gate in shared mode and remain concurrent; a reindex or large structural
+operation holds it exclusively, so the repository is read-only for the
+duration while ordinary reads continue (writes get "Temporarily
+Unavailable"). `processed_hash` is always read before HEAD, which — since the
+hash is committed only after the branch reference advances — guarantees it is
+never mistaken for a descendant of a momentarily-stale HEAD. The `gitstore`
+package serializes access to the underlying (non-thread-safe) go-git library
+so the store is a safe concurrent abstraction. These paths are covered by a
+concurrent-torture suite (mixed operations under a live reindex, two
+processes sharing one repository, foreign-commit drift) asserting that the
+live projection always equals a from-scratch rebuild, plus fuzz tests for
+JSON round-trip stability, path classification and NUL/oversize input
+handling.
+
 ## Running it
 
 Requirements: Go ≥ 1.24, Node ≥ 20, PostgreSQL ≥ 14 with the `ltree`

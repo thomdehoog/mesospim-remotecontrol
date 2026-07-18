@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -41,6 +42,35 @@ func Connect(ctx context.Context, dsn string) (*DB, error) {
 
 // Close releases the pool.
 func (db *DB) Close() { db.Pool.Close() }
+
+// ftsCap bounds full-text input. PostgreSQL rejects a tsvector larger than
+// 1 MiB; capping the source text keeps a hostile multi-megabyte value from
+// wedging the projection while still indexing a generous prefix.
+const ftsCap = 900_000
+
+// sanitize strips NUL bytes, which PostgreSQL cannot store in a text or
+// tsvector column. Projected columns are derived display values; the
+// authoritative bytes are always preserved verbatim in Git.
+func sanitize(s string) string {
+	if strings.IndexByte(s, 0) < 0 {
+		return s
+	}
+	return strings.ReplaceAll(s, "\x00", "")
+}
+
+// clampFTS sanitizes and truncates text destined for a tsvector on a rune
+// boundary, keeping the result valid UTF-8.
+func clampFTS(s string) string {
+	s = sanitize(s)
+	if len(s) <= ftsCap {
+		return s
+	}
+	cut := ftsCap
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
 
 // ---- ltree path encoding ----
 
@@ -85,12 +115,12 @@ type Artifact struct {
 func (db *DB) UpsertArtifact(ctx context.Context, tx pgx.Tx, a Artifact) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO artifacts (guid, kind, type, title, hid, repo_path, parent_path, ltpath, content, updated_commit, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8::ltree,$9::jsonb,$10, now())
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8::ltree,$9,$10, now())
 		ON CONFLICT (guid) DO UPDATE SET
 		  kind=$2, type=$3, title=$4, hid=$5, repo_path=$6, parent_path=$7,
-		  ltpath=$8::ltree, content=$9::jsonb, updated_commit=$10, updated_at=now()`,
-		a.GUID, a.Kind, a.Type, a.Title, a.HID, a.RepoPath, a.ParentPath,
-		EncodePath(a.ParentPath), string(a.Content), a.UpdatedCommit)
+		  ltpath=$8::ltree, content=$9, updated_commit=$10, updated_at=now()`,
+		a.GUID, sanitize(a.Kind), sanitize(a.Type), sanitize(a.Title), sanitize(a.HID),
+		a.RepoPath, a.ParentPath, EncodePath(a.ParentPath), sanitize(string(a.Content)), a.UpdatedCommit)
 	if err != nil {
 		return fmt.Errorf("upsert artifact %s: %w", a.GUID, err)
 	}
@@ -153,7 +183,7 @@ func (db *DB) ReplaceFieldIndex(ctx context.Context, tx pgx.Tx, guid string, fie
 			}
 			if _, err := tx.Exec(ctx,
 				`INSERT INTO field_index (guid, field, value) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
-				guid, field, v); err != nil {
+				guid, sanitize(field), sanitize(v)); err != nil {
 				return err
 			}
 		}
@@ -165,7 +195,7 @@ func (db *DB) ReplaceFieldIndex(ctx context.Context, tx pgx.Tx, guid string, fie
 func (db *DB) UpsertFTS(ctx context.Context, tx pgx.Tx, guid, text string) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO fts (guid, tsv) VALUES ($1, to_tsvector('simple', $2))
-		ON CONFLICT (guid) DO UPDATE SET tsv=to_tsvector('simple', $2)`, guid, text)
+		ON CONFLICT (guid) DO UPDATE SET tsv=to_tsvector('simple', $2)`, guid, clampFTS(text))
 	return err
 }
 
@@ -240,9 +270,9 @@ func (db *DB) PruneFolders(ctx context.Context, tx pgx.Tx) error {
 func (db *DB) UpsertConfigObject(ctx context.Context, tx pgx.Tx, storagePath, scopePath, category, name string, content []byte) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO config_objects (storage_path, scope_path, scope_lt, category, name, content)
-		VALUES ($1,$2,$3::ltree,$4,$5,$6::jsonb)
-		ON CONFLICT (storage_path) DO UPDATE SET scope_path=$2, scope_lt=$3::ltree, category=$4, name=$5, content=$6::jsonb`,
-		storagePath, scopePath, EncodePath(scopePath), category, name, string(content))
+		VALUES ($1,$2,$3::ltree,$4,$5,$6)
+		ON CONFLICT (storage_path) DO UPDATE SET scope_path=$2, scope_lt=$3::ltree, category=$4, name=$5, content=$6`,
+		storagePath, scopePath, EncodePath(scopePath), sanitize(category), sanitize(name), sanitize(string(content)))
 	return err
 }
 

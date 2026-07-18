@@ -44,7 +44,7 @@ func main() {
 	svc := repo.New(git, db, sc)
 	svc.AuthorName = cfg.Author.Name
 	svc.AuthorEmail = cfg.Author.Email
-	if err := svc.Sync(ctx); err != nil {
+	if err := svc.SyncOrReindex(ctx); err != nil {
 		log.Fatal(err)
 	}
 

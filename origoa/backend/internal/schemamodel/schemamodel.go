@@ -60,11 +60,11 @@ type FieldDef struct {
 
 // RelationshipDef constrains semantic links between artifact types.
 type RelationshipDef struct {
-	LinkType    string   `json:"linkType"`
-	DisplayName string   `json:"displayName,omitempty"`
-	SourceTypes []string `json:"sourceTypes,omitempty"` // empty = any
-	TargetTypes []string `json:"targetTypes,omitempty"`
-	Cardinality string   `json:"cardinality,omitempty"` // one-to-one | one-to-many | many-to-one | many-to-many
+	LinkType    string     `json:"linkType"`
+	DisplayName string     `json:"displayName,omitempty"`
+	SourceTypes []string   `json:"sourceTypes,omitempty"` // empty = any
+	TargetTypes []string   `json:"targetTypes,omitempty"`
+	Cardinality string     `json:"cardinality,omitempty"` // one-to-one | one-to-many | many-to-one | many-to-many
 	Fields      []FieldDef `json:"fields,omitempty"`
 }
 
