@@ -110,6 +110,11 @@ func (h *Hub) HandleWS(w http.ResponseWriter, r *http.Request) {
 			c.editing = m.Editing
 			h.mu.Unlock()
 			h.broadcastPresence()
+		case "editing":
+			h.mu.Lock()
+			c.editing = m.Editing
+			h.mu.Unlock()
+			h.broadcastPresence()
 		}
 	}
 }

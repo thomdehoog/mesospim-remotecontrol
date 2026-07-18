@@ -56,8 +56,15 @@ update projections → acquire the repository mutex → publish via
 compare-and-swap `update-ref` (on conflict: release, roll back, rebuild,
 retry) → update `processed_hash` → release the mutex → commit. Direct Git
 pushes from external tooling are picked up by replay; if incremental replay
-is impossible the backend falls back to a full reindex (GUID recognition →
-field indexing → full-text rebuild → history scan for deleted artifacts).
+is impossible the backend falls back to a full reindex (history
+reconstruction of the complete HID history → GUID recognition → field
+indexing → bulk full-text rebuild with the GIN index dropped and recreated →
+history scan for deleted artifacts). Because the reindex walks Git history to
+rebuild the identifier history, no derived data — including every HID ever
+assigned and the commit that assigned it — is lost across a rebuild. A
+background loop also continuously synchronizes the projection, so commits
+pushed straight into the Git repository by external tooling are picked up
+without waiting for the next API write.
 
 Concurrency follows the spec's two mechanisms. Writers hold the Maintenance
 Mode gate in shared mode and remain concurrent; a reindex or large structural
@@ -126,7 +133,9 @@ through a small sanitizer (`src/sanitize.ts`) before rendering.
 ## API sketch
 
 Artifact APIs: `POST /api/entries|documents|links|comments`,
-`GET|PATCH|DELETE /api/artifacts/{guid}`, `POST /api/artifacts/{guid}/move`,
+`GET|PATCH|DELETE /api/artifacts/{guid}`, `PATCH /api/links/{guid}`
+(custom fields), `PATCH /api/comments/{guid}` (text),
+`POST /api/artifacts/{guid}/move`,
 `POST /api/artifacts/{guid}/workflows/{name}/transition`.
 
 Service APIs: `GET /api/tree`, `GET /api/search` (full text, kind/type,

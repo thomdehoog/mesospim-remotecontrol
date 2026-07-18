@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -484,5 +485,118 @@ func TestHIDHistoryTracksChanges(t *testing.T) {
 	dup := "REQ-9999"
 	if err := s.UpdateArtifact(ctx, other, UpdateArtifactParams{HID: &dup}); err == nil {
 		t.Fatal("duplicate HID accepted")
+	}
+}
+
+// TestHIDHistorySurvivesReindex is the regression for the invariant that the
+// full HID history — every assigned identifier and the commit that assigned
+// it — is reconstructable from Git alone. A HEAD-only projection would
+// collapse it to a single row attributed to HEAD; the history walk must
+// restore it exactly.
+func TestHIDHistorySurvivesReindex(t *testing.T) {
+	s, ctx := newService(t)
+	seedConfig(t, s, ctx)
+	guid, _ := s.CreateArtifact(ctx, CreateArtifactParams{Kind: "entry", Folder: "reqs", Type: "requirement", Title: "R"})
+	newHID := "REQ-9999"
+	if err := s.UpdateArtifact(ctx, guid, UpdateArtifactParams{HID: &newHID}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.DB.HIDHistory(ctx, guid)
+	if err != nil || len(before) != 2 {
+		t.Fatalf("expected 2 historical HIDs before reindex, got %v (%v)", before, err)
+	}
+	head, err := s.Git.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first HID was assigned before HEAD: its commit must not be HEAD.
+	if before[0].CommitHash == head.String() {
+		t.Fatalf("first HID wrongly attributed to HEAD %s", head)
+	}
+
+	if err := s.Reindex(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.DB.HIDHistory(ctx, guid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("reindex changed HID history length: before %v, after %v", before, after)
+	}
+	for i := range before {
+		if after[i] != before[i] {
+			t.Fatalf("reindex diverged HID history at %d: before %+v after %+v", i, before[i], after[i])
+		}
+	}
+}
+
+func TestUpdateLinkFields(t *testing.T) {
+	s, ctx := newService(t)
+	seedConfig(t, s, ctx)
+	a, _ := s.CreateArtifact(ctx, CreateArtifactParams{Kind: "entry", Folder: "x", Type: "requirement", Title: "A"})
+	b, _ := s.CreateArtifact(ctx, CreateArtifactParams{Kind: "entry", Folder: "x", Type: "testcase", Title: "B"})
+	link, err := s.CreateLink(ctx, CreateLinkParams{Type: "satisfies", Source: a, Target: b, Fields: map[string]any{"weight": "high"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateLink(ctx, link, UpdateLinkParams{Fields: map[string]any{"weight": "low", "note": "revised"}}); err != nil {
+		t.Fatal(err)
+	}
+	row, err := s.DB.GetArtifact(ctx, link)
+	if err != nil || row == nil {
+		t.Fatalf("link gone: %v", err)
+	}
+	af, err := parseArtifact(row.Content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if af.Fields["weight"] != "low" || af.Fields["note"] != "revised" {
+		t.Fatalf("link fields not updated: %+v", af.Fields)
+	}
+	// Updating a non-link through the link API is rejected.
+	if err := s.UpdateLink(ctx, a, UpdateLinkParams{Fields: map[string]any{"x": "y"}}); err == nil {
+		t.Fatal("UpdateLink accepted an entry")
+	}
+}
+
+func TestUpdateComment(t *testing.T) {
+	s, ctx := newService(t)
+	seedConfig(t, s, ctx)
+	subj, _ := s.CreateArtifact(ctx, CreateArtifactParams{Kind: "entry", Folder: "x", Type: "requirement", Title: "A"})
+	c, err := s.CreateComment(ctx, CreateCommentParams{Subject: subj, Text: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited := "edited text"
+	if err := s.UpdateComment(ctx, c, UpdateCommentParams{Text: &edited}); err != nil {
+		t.Fatal(err)
+	}
+	row, _ := s.DB.GetArtifact(ctx, c)
+	af, _ := parseArtifact(row.Content)
+	if af.Text != edited {
+		t.Fatalf("comment text not updated: %q", af.Text)
+	}
+	// Empty text is rejected.
+	blank := "   "
+	if err := s.UpdateComment(ctx, c, UpdateCommentParams{Text: &blank}); err == nil {
+		t.Fatal("blank comment text accepted")
+	}
+}
+
+func TestMoveArtifactCommitMessage(t *testing.T) {
+	s, ctx := newService(t)
+	seedConfig(t, s, ctx)
+	guid, _ := s.CreateArtifact(ctx, CreateArtifactParams{Kind: "entry", Folder: "src", Type: "testcase", Title: "M"})
+	if err := s.MoveArtifact(ctx, guid, "dst", ""); err != nil {
+		t.Fatal(err)
+	}
+	head, _ := s.Git.Head()
+	commit, err := s.Git.Commit(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(commit.Message); got != fmt.Sprintf("Entry %s moved to dst", guid) {
+		t.Fatalf("unexpected move commit message: %q", got)
 	}
 }

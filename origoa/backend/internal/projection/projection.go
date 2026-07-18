@@ -256,6 +256,45 @@ func (db *DB) RecordHID(ctx context.Context, tx pgx.Tx, guid, hid, commit string
 	return err
 }
 
+// LatestHID returns the most recently recorded HID for an artifact, or ""
+// when none has been recorded. Ordering by seq (not changed_at, which is
+// constant within a transaction) makes this correct during a reindex that
+// reconstructs the whole history in one transaction.
+func (db *DB) LatestHID(ctx context.Context, tx pgx.Tx, guid string) (string, error) {
+	var hid string
+	err := queryRow(ctx, db, tx,
+		`SELECT hid FROM hid_history WHERE guid=$1 ORDER BY seq DESC LIMIT 1`, []any{guid}, &hid)
+	if err == pgx.ErrNoRows {
+		return "", nil
+	}
+	return hid, err
+}
+
+// DropFTSIndex / CreateFTSIndex bracket a bulk full-text rebuild: dropping
+// the GIN index before repopulating the fts table and recreating it
+// afterwards is dramatically faster than maintaining the index row-by-row,
+// as the reindex algorithm prescribes. Both run inside the reindex
+// transaction, so a rollback restores the original index.
+func (db *DB) DropFTSIndex(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `DROP INDEX IF EXISTS fts_gin`)
+	return err
+}
+
+// CreateFTSIndex recreates the full-text GIN index after a bulk rebuild.
+func (db *DB) CreateFTSIndex(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `CREATE INDEX IF NOT EXISTS fts_gin ON fts USING gin (tsv)`)
+	return err
+}
+
+// BoostMaintenanceMem raises maintenance_work_mem for the current
+// transaction so the full-text index build (and any other maintenance work
+// in the reindex) can use more memory, as the reindex algorithm prescribes.
+// SET LOCAL scopes the change to the transaction; it reverts on commit.
+func (db *DB) BoostMaintenanceMem(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `SET LOCAL maintenance_work_mem = '256MB'`)
+	return err
+}
+
 // EnsureFolders inserts the folder and all its ancestors.
 func (db *DB) EnsureFolders(ctx context.Context, tx pgx.Tx, folder string) error {
 	folder = strings.Trim(folder, "/")

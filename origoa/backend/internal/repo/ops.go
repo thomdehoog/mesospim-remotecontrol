@@ -292,27 +292,7 @@ func (s *Service) UpdateArtifact(ctx context.Context, guid string, p UpdateArtif
 				obj.Set("base", *p.Base)
 			}
 		}
-		if p.Fields != nil {
-			fieldsObj := obj.GetObject("fields")
-			if fieldsObj == nil {
-				obj.SetAny("fields", map[string]any{})
-				fieldsObj = obj.GetObject("fields")
-			}
-			// Deterministic merge order for reproducible commits.
-			keys := make([]string, 0, len(p.Fields))
-			for k := range p.Fields {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			for _, k := range keys {
-				v := p.Fields[k]
-				if v == nil {
-					fieldsObj.Delete(k)
-				} else {
-					fieldsObj.SetAny(k, v)
-				}
-			}
-		}
+		mergeFields(obj, p.Fields)
 		if p.Sections != nil {
 			if cur.Kind != artifact.KindDocument {
 				return "", validationErr("sections can only be set on documents")
@@ -430,7 +410,11 @@ func (s *Service) MoveArtifact(ctx context.Context, guid, newFolder, ifRevision 
 		}
 		cs.DeleteDir(oldDir)
 		s.relocateMetadata(ctx, head, cs, guid, cur.ParentPath, folder)
-		return fmt.Sprintf("Folder %s moved to %s", oldDir, newDir), nil
+		kindName := "Entry"
+		if cur.Kind == artifact.KindDocument {
+			kindName = "Document"
+		}
+		return fmt.Sprintf("%s %s moved to %s", kindName, guid, folderLabel(folder)), nil
 	})
 	if err == nil {
 		s.emit(Event{Type: "artifact-moved", GUID: guid, Path: folder})
@@ -511,14 +495,20 @@ func (s *Service) CreateLink(ctx context.Context, p CreateLinkParams) (string, e
 	if target == nil {
 		return "", validationErr("target artifact %s not found", p.Target)
 	}
-	if err := s.validateRelationship(ctx, p.Type, source, target); err != nil {
-		return "", err
-	}
 	guid := uuid.NewString()
 	cfgFolder := s.Scanner.Config().ConfigFolders[0]
 	storagePath := path.Join(source.ParentPath, cfgFolder, "links", guid+".json")
 
 	_, err = s.Update(ctx, func(head plumbing.Hash, cs *gitstore.Changeset) (string, error) {
+		// Relationship constraints (types and cardinality) are validated
+		// inside the update transaction: the cardinality count is read from
+		// the projection synchronized to the current head, and the build is
+		// re-run on every CAS retry, so a link a concurrent writer just
+		// published is seen before this one commits. Two racing links can
+		// never both slip past a one-to-one/one-to-many bound.
+		if err := s.validateRelationship(ctx, p.Type, source, target); err != nil {
+			return "", err
+		}
 		doc := ojson.NewDoc()
 		obj, _ := doc.RootObject()
 		obj.Set("guid", guid)
@@ -591,6 +581,78 @@ func (s *Service) validateRelationship(ctx context.Context, linkType string, sou
 		}
 	}
 	return nil
+}
+
+// UpdateLinkParams patches a link's custom fields.
+type UpdateLinkParams struct {
+	Fields     map[string]any `json:"fields,omitempty"`     // merged; null removes a field
+	IfRevision string         `json:"ifRevision,omitempty"` // optimistic concurrency
+}
+
+// UpdateLink patches the custom fields of a link. The endpoints and type of
+// a link are immutable (they define the relationship); only the schema-
+// defined custom fields carried on the link may change.
+func (s *Service) UpdateLink(ctx context.Context, guid string, p UpdateLinkParams) error {
+	row, err := s.requireArtifact(ctx, guid, p.IfRevision)
+	if err != nil {
+		return err
+	}
+	if row.Kind != artifact.KindLink {
+		return validationErr("artifact %s is a %s, not a link", guid, row.Kind)
+	}
+	_, err = s.Update(ctx, func(head plumbing.Hash, cs *gitstore.Changeset) (string, error) {
+		cur, err := s.DB.GetArtifact(ctx, guid)
+		if err != nil {
+			return "", err
+		}
+		if cur == nil {
+			return "", ErrNotFound
+		}
+		doc, _, err := s.loadArtifactAt(head, cur.RepoPath, cur.Kind)
+		if err != nil {
+			return "", err
+		}
+		obj, err := doc.RootObject()
+		if err != nil {
+			return "", err
+		}
+		mergeFields(obj, p.Fields)
+		if !doc.Modified() {
+			return "", nil
+		}
+		cs.Write(cur.RepoPath, doc.Bytes())
+		return fmt.Sprintf("Link %s updated", guid), nil
+	})
+	if err == nil {
+		s.emit(Event{Type: "link-updated", GUID: guid})
+	}
+	return err
+}
+
+// mergeFields applies a field patch to an artifact's "fields" object: a nil
+// value removes the key, any other value sets it. Keys are applied in sorted
+// order for reproducible commits.
+func mergeFields(obj *ojson.Object, fields map[string]any) {
+	if fields == nil {
+		return
+	}
+	fieldsObj := obj.GetObject("fields")
+	if fieldsObj == nil {
+		obj.SetAny("fields", map[string]any{})
+		fieldsObj = obj.GetObject("fields")
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if v := fields[k]; v == nil {
+			fieldsObj.Delete(k)
+		} else {
+			fieldsObj.SetAny(k, v)
+		}
+	}
 }
 
 func (s *Service) findRelationshipDef(ctx context.Context, linkType string, source *projection.ArtifactRow) *schemamodel.RelationshipDef {
@@ -684,6 +746,60 @@ func (s *Service) CreateComment(ctx context.Context, p CreateCommentParams) (str
 	}
 	s.emit(Event{Type: "comment-created", GUID: guid, Detail: p.Subject})
 	return guid, nil
+}
+
+// UpdateCommentParams patches a comment.
+type UpdateCommentParams struct {
+	Text       *string `json:"text,omitempty"`
+	IfRevision string  `json:"ifRevision,omitempty"`
+}
+
+// UpdateComment edits the text of an existing comment. Its subject and
+// thread parent are immutable.
+func (s *Service) UpdateComment(ctx context.Context, guid string, p UpdateCommentParams) error {
+	row, err := s.requireArtifact(ctx, guid, p.IfRevision)
+	if err != nil {
+		return err
+	}
+	if row.Kind != artifact.KindComment {
+		return validationErr("artifact %s is a %s, not a comment", guid, row.Kind)
+	}
+	if p.Text != nil && strings.TrimSpace(*p.Text) == "" {
+		return validationErr("comment text must not be empty")
+	}
+	_, err = s.Update(ctx, func(head plumbing.Hash, cs *gitstore.Changeset) (string, error) {
+		cur, err := s.DB.GetArtifact(ctx, guid)
+		if err != nil {
+			return "", err
+		}
+		if cur == nil {
+			return "", ErrNotFound
+		}
+		doc, _, err := s.loadArtifactAt(head, cur.RepoPath, cur.Kind)
+		if err != nil {
+			return "", err
+		}
+		obj, err := doc.RootObject()
+		if err != nil {
+			return "", err
+		}
+		if p.Text != nil {
+			obj.Set("text", *p.Text)
+		}
+		if !doc.Modified() {
+			return "", nil
+		}
+		cs.Write(cur.RepoPath, doc.Bytes())
+		return fmt.Sprintf("Comment %s updated", guid), nil
+	})
+	if err == nil {
+		subject := ""
+		if af, perr := artifact.Parse(row.Content); perr == nil {
+			subject = af.Subject
+		}
+		s.emit(Event{Type: "comment-updated", GUID: guid, Detail: subject})
+	}
+	return err
 }
 
 // ---- Workflow transitions ----

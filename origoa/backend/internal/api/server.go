@@ -35,6 +35,20 @@ type Server struct {
 	// for any). Empty disables CORS entirely, which is correct for the
 	// production topology where the API serves the SPA same-origin.
 	CORSOrigin string
+
+	// baseCtx is the server-lifetime context, set by Serve. Detached work
+	// that must outlive a single request (a background reindex) runs on it,
+	// so it still stops on graceful shutdown but not on request completion.
+	baseCtx context.Context
+}
+
+// baseContext returns the server-lifetime context, falling back to
+// context.Background before Serve has run (e.g. in tests).
+func (s *Server) baseContext() context.Context {
+	if s.baseCtx != nil {
+		return s.baseCtx
+	}
+	return context.Background()
 }
 
 // NewServer creates the API server and connects the event hub.
@@ -70,7 +84,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/artifacts/{guid}/overlay", s.handleOverlay)
 	mux.HandleFunc("POST /api/artifacts/{guid}/workflows/{name}/transition", s.handleTransition)
 	mux.HandleFunc("POST /api/links", s.handleCreateLink)
+	mux.HandleFunc("PATCH /api/links/{guid}", s.handleUpdateLink)
 	mux.HandleFunc("POST /api/comments", s.handleCreateComment)
+	mux.HandleFunc("PATCH /api/comments/{guid}", s.handleUpdateComment)
 
 	// Folder operations
 	mux.HandleFunc("POST /api/folders", s.handleCreateFolder)
@@ -238,6 +254,7 @@ func artifactListJSON(rows []projection.ArtifactRow) []map[string]any {
 // WebSocket session connections. Request bodies are separately capped by
 // MaxBytesReader at the handler.
 func (s *Server) Serve(ctx context.Context, addr string) error {
+	s.baseCtx = ctx
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           s.Handler(),

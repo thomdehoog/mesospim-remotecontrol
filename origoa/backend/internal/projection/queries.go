@@ -299,7 +299,7 @@ type HIDHistoryEntry struct {
 // HIDHistory lists all HIDs ever assigned to an artifact.
 func (db *DB) HIDHistory(ctx context.Context, guid string) ([]HIDHistoryEntry, error) {
 	rows, err := db.Pool.Query(ctx, `
-		SELECT hid, commit_hash FROM hid_history WHERE guid=$1 ORDER BY changed_at, hid`, guid)
+		SELECT hid, commit_hash FROM hid_history WHERE guid=$1 ORDER BY seq`, guid)
 	if err != nil {
 		return nil, err
 	}

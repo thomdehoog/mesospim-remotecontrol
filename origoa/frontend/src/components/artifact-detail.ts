@@ -66,6 +66,7 @@ export class ArtifactDetailView extends StoreElement {
     const schema = d.schema;
     const resolved = d.resolved;
     const dirty = Object.keys(this.pending).length > 0 || this.pendingTitle !== null;
+    this.publishEditing(dirty);
     const others = this.app.presence.filter((p) => p.viewing === d.guid).length - 1;
     return html`
       <div class="head">
@@ -149,6 +150,20 @@ export class ArtifactDetailView extends StoreElement {
         <button class="danger" @click=${this.removeArtifact}>Delete</button>
       </div>
     `;
+  }
+
+  // publishEditing mirrors this view's unsaved-edit state into the store so
+  // the session client can broadcast editing presence and so an incoming
+  // remote change to the same artifact preserves (rather than discards) the
+  // local edits. This element does not observe 'editing', so the update
+  // never re-enters its own render.
+  private publishEditing(dirty: boolean): void {
+    if (this.app.editing !== dirty) store.update({ editing: dirty });
+  }
+
+  disconnectedCallback(): void {
+    super.disconnectedCallback();
+    if (this.app.editing) store.update({ editing: false });
   }
 
   private jump(id: string): void {

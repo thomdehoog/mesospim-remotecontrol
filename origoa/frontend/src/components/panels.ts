@@ -203,6 +203,7 @@ export class LinksPanel extends LitElement {
 export class CommentsPanel extends LitElement {
   @property({ attribute: false }) detail!: ArtifactDetail;
   @state() private replyTo = '';
+  @state() private editId = '';
 
   static styles = [panelStyles, css`
     .comment { padding: 8px 10px; background: var(--bg); border-radius: 8px; margin-bottom: 6px; }
@@ -230,8 +231,11 @@ export class CommentsPanel extends LitElement {
           <b>${c.content?.author || 'anonymous'}</b>
           <span>${c.content?.createdAt ? new Date(c.content.createdAt).toLocaleString() : ''}</span>
           <a class="ref" style="margin-left:auto" @click=${() => { this.replyTo = this.replyTo === c.guid ? '' : c.guid; }}>reply</a>
+          <a class="ref" @click=${() => { this.editId = this.editId === c.guid ? '' : c.guid; }}>edit</a>
         </div>
-        <div>${c.content?.text ?? ''}</div>
+        ${this.editId === c.guid
+          ? this.editForm(c)
+          : html`<div>${c.content?.text ?? ''}</div>`}
         ${this.replyTo === c.guid ? this.form(c.guid) : nothing}
       </div>
       ${children.length ? html`<div class="thread">${children.map((k) => this.renderThread(k, all))}</div>` : nothing}
@@ -243,6 +247,27 @@ export class CommentsPanel extends LitElement {
       <input class="text" placeholder=${parent ? 'Reply…' : 'Add a comment…'} required />
       <button class="primary">${parent ? 'Reply' : 'Comment'}</button>
     </form>`;
+  }
+
+  private editForm(c: CommentInfo) {
+    return html`<form @submit=${(e: Event) => this.saveEdit(e, c.guid)}>
+      <input class="text" .value=${c.content?.text ?? ''} required />
+      <button class="primary">Save</button>
+      <button type="button" @click=${() => { this.editId = ''; }}>Cancel</button>
+    </form>`;
+  }
+
+  private async saveEdit(e: Event, guid: string): Promise<void> {
+    e.preventDefault();
+    const input = (e.target as HTMLFormElement).querySelector<HTMLInputElement>('input.text')!;
+    try {
+      await api.updateComment(guid, { text: input.value });
+      this.editId = '';
+      notify('Comment updated');
+      refreshDetail();
+    } catch (err) {
+      store.update({ error: errText(err) });
+    }
   }
 
   private async submit(e: Event, parent: string): Promise<void> {

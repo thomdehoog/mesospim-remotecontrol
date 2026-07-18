@@ -163,6 +163,31 @@ func (s *Service) SyncOrReindex(ctx context.Context) error {
 	return nil
 }
 
+// BackgroundSync continuously synchronizes the projection with the Git
+// repository at the given interval, so commits pushed directly into the Git
+// repository by external tooling are picked up without waiting for the next
+// API write. It enters Maintenance Mode as a reader (skipping a tick that
+// collides with a running reindex) and returns when ctx is cancelled.
+func (s *Service) BackgroundSync(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if !s.maint.TryRLock() {
+				continue // a reindex holds the repository read-only; try again next tick
+			}
+			err := s.Sync(ctx)
+			s.maint.RUnlock()
+			if err != nil && ctx.Err() == nil {
+				log.Printf("repo: background sync: %v", err)
+			}
+		}
+	}
+}
+
 // BuildFunc constructs the changeset of one logical repository operation
 // on top of the given head revision and returns the structured commit
 // message. It is re-invoked when a concurrent update forces a retry.
@@ -285,14 +310,20 @@ func retryBackoff(attempt int) {
 
 // Reindex performs a complete repository rebuild from Git:
 //
-//	Phase 1 — GUID recognition: rebuild the GUID → path translation.
-//	Phase 2 — Field indexing: metadata and schema-defined field index.
-//	Phase 3 — Full-text rebuild.
+//	Phase 1 — History reconstruction: walk Git history to rebuild the full
+//	          HID history (every assigned identifier and the commit that
+//	          assigned it) so no derived data is lost across a rebuild.
+//	Phase 2 — GUID recognition & field indexing: rebuild the GUID → path
+//	          translation, metadata and schema-defined field index.
+//	Phase 3 — Full-text rebuild: drop the GIN index, repopulate the fts
+//	          table and recreate the index in bulk (the algorithm the spec
+//	          prescribes), with maintenance_work_mem raised for the build.
 //	Phase 4 — History scan: record deleted artifacts and their commits.
 //
-// Phases 1–3 share one tree traversal (the foundation indexer projects
-// identity, fields and text per artifact); the history scan then walks
-// backwards through Git history.
+// The whole rebuild runs in a single transaction under the exclusive
+// Maintenance Mode lock, so reads observe consistent pre-reindex data
+// throughout and the projection flips atomically on commit; it can never
+// expose a half-truncated state.
 func (s *Service) Reindex(ctx context.Context) error {
 	if !s.reindexing.CompareAndSwap(false, true) {
 		return errors.New("reindex already running")
@@ -328,14 +359,37 @@ func (s *Service) Reindex(ctx context.Context) error {
 	if err := s.DB.Reset(ctx, tx); err != nil {
 		return err
 	}
+	if err := s.DB.BoostMaintenanceMem(ctx, tx); err != nil {
+		return err
+	}
 
-	s.setProgress("guid-recognition", "rebuilding GUID translation table")
-	s.setProgress("field-indexing", "rebuilding metadata and field index")
-	s.setProgress("fulltext", "rebuilding full-text indexes")
+	// Phase 1 — reconstruct HID history from Git before projecting HEAD, so
+	// the HEAD projection recognizes each artifact's current HID as already
+	// recorded (at its true assigning commit) and does not re-attribute it.
+	s.setProgress("history-reconstruction", "rebuilding identifier history")
+	if err := s.reconstructHIDHistory(ctx, tx, head); err != nil {
+		return err
+	}
+
+	// Phase 3's bulk full-text rebuild: drop the GIN index up front so the
+	// per-artifact fts inserts during projection are cheap, then rebuild it
+	// once at the end.
+	if err := s.DB.DropFTSIndex(ctx, tx); err != nil {
+		return err
+	}
+
+	// Phase 2 — GUID recognition and field indexing (one tree traversal).
+	s.setProgress("guid-recognition", "rebuilding GUID translation and field index")
 	if !head.IsZero() {
 		if err := s.Scanner.ProjectTree(ctx, tx, head); err != nil {
 			return err
 		}
+	}
+
+	// Phase 3 — recreate the full-text index in bulk.
+	s.setProgress("fulltext", "building full-text index")
+	if err := s.DB.CreateFTSIndex(ctx, tx); err != nil {
+		return err
 	}
 
 	s.setProgress("history-scan", "recording deleted artifacts")
@@ -350,6 +404,56 @@ func (s *Service) Reindex(ctx context.Context) error {
 		return err
 	}
 	s.setProgress("", "")
+	return nil
+}
+
+// reconstructHIDHistory rebuilds the complete HID history by walking Git
+// oldest → newest and recording each artifact's HID at the commit that
+// first assigned it (and again whenever it changes). This restores the
+// "history of all assigned HIDs together with the commit in which the
+// change occurred" invariant that a HEAD-only projection cannot recover.
+func (s *Service) reconstructHIDHistory(ctx context.Context, tx pgx.Tx, head plumbing.Hash) error {
+	if head.IsZero() {
+		return nil
+	}
+	chain, err := s.Git.CommitsBetween(plumbing.ZeroHash, head)
+	if err != nil {
+		return err
+	}
+	cfg := s.Scanner.Config()
+	lastHID := map[string]string{} // GUID → most recently recorded HID
+	for _, h := range chain {
+		changes, err := s.Git.DiffCommit(h)
+		if err != nil {
+			return err
+		}
+		for _, ch := range changes {
+			if ch.Action == gitstore.Deleted {
+				continue
+			}
+			cl := cfg.Classify(ch.Path)
+			isArtifact := cl.Class == scanner.ArtifactFile ||
+				(cl.Class == scanner.ConfigObjectFile && (cl.Category == "links" || cl.Category == "comments"))
+			if !isArtifact {
+				continue
+			}
+			content, ok, err := s.Git.ReadBlob(h, ch.Path)
+			if err != nil || !ok {
+				continue
+			}
+			af, err := parseArtifact(content)
+			if err != nil || af.HID == "" {
+				continue
+			}
+			if lastHID[af.GUID] == af.HID {
+				continue
+			}
+			if err := s.DB.RecordHID(ctx, tx, af.GUID, af.HID, h.String()); err != nil {
+				return err
+			}
+			lastHID[af.GUID] = af.HID
+		}
+	}
 	return nil
 }
 

@@ -66,14 +66,20 @@ CREATE TABLE IF NOT EXISTS comment_index (
 );
 CREATE INDEX IF NOT EXISTS comment_index_subject ON comment_index (subject);
 
--- History of assigned human-readable identifiers.
+-- History of assigned human-readable identifiers. seq gives a stable
+-- assignment order (now() is constant within a transaction, so a reindex
+-- that reconstructs the whole history in one transaction cannot rely on
+-- changed_at to order the rows it inserts).
 CREATE TABLE IF NOT EXISTS hid_history (
+    seq         bigint GENERATED ALWAYS AS IDENTITY,
     guid        uuid NOT NULL,
     hid         text NOT NULL,
     commit_hash text NOT NULL,
     changed_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (guid, hid, commit_hash)
 );
+ALTER TABLE hid_history ADD COLUMN IF NOT EXISTS seq bigint GENERATED ALWAYS AS IDENTITY;
+CREATE INDEX IF NOT EXISTS hid_history_guid_seq ON hid_history (guid, seq);
 
 -- Deleted artifacts retained for history inspection.
 CREATE TABLE IF NOT EXISTS deleted_artifacts (

@@ -67,13 +67,17 @@ func (f *FoundationIndexer) Upsert(ctx context.Context, tx pgx.Tx, cl Classified
 }
 
 func (f *FoundationIndexer) upsertArtifact(ctx context.Context, tx pgx.Tx, af *artifact.File, repoPath, parentDir string, content []byte, commit string) error {
-	// HID history: record when the HID is new for this artifact.
-	var oldHID string
-	err := tx.QueryRow(ctx, `SELECT hid FROM artifacts WHERE guid=$1`, af.GUID).Scan(&oldHID)
-	if err != nil && err != pgx.ErrNoRows {
+	// HID history: record when the HID differs from the last one recorded
+	// for this artifact. Comparing against the recorded history (rather than
+	// the projected artifact row) keeps this correct during a reindex, where
+	// the artifacts table starts empty but the history has already been
+	// reconstructed from Git — so the current HID is not re-recorded against
+	// HEAD.
+	latestHID, err := f.DB.LatestHID(ctx, tx, af.GUID)
+	if err != nil {
 		return err
 	}
-	if af.HID != "" && af.HID != oldHID {
+	if af.HID != "" && af.HID != latestHID {
 		if err := f.DB.RecordHID(ctx, tx, af.GUID, af.HID, commit); err != nil {
 			return err
 		}

@@ -78,8 +78,12 @@ export const api = {
 
   createLink: (p: { type: string; source: string; target: string }) =>
     request<{ guid: string }>('POST', '/api/links', p),
+  updateLink: (guid: string, patch: { fields?: Record<string, unknown>; ifRevision?: string }) =>
+    request<ArtifactSummary>('PATCH', `/api/links/${guid}`, patch),
   createComment: (p: { subject: string; parent?: string; author?: string; text: string }) =>
     request<{ guid: string }>('POST', '/api/comments', p),
+  updateComment: (guid: string, patch: { text?: string; ifRevision?: string }) =>
+    request<ArtifactSummary>('PATCH', `/api/comments/${guid}`, patch),
 
   createFolder: (path: string) => request<{ path: string }>('POST', '/api/folders', { path }),
 };

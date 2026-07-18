@@ -68,6 +68,11 @@ func main() {
 	}
 	log.Printf("origoa: projection synchronized")
 
+	// Continuously synchronize with the Git repository so commits pushed
+	// directly into it by external tooling are projected without waiting for
+	// the next API write.
+	go svc.BackgroundSync(ctx, 5*time.Second)
+
 	server := api.NewServer(svc, cfg.StaticDir, cfg.CORSOrigin)
 	if err := server.Serve(ctx, cfg.Listen); err != nil {
 		log.Fatal(err)

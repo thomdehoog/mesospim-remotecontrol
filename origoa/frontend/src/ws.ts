@@ -11,10 +11,15 @@ const user = `user-${Math.random().toString(36).slice(2, 7)}`;
 
 export function initSession(): void {
   connect();
-  // Report which artifact this session is viewing.
+  // Report which artifact this session is viewing, and whether it is being
+  // edited, so other sessions see live presence.
   store.subscribe((state, changed) => {
-    if (changed.has('selected') && socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: 'viewing', guid: state.selected }));
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    if (changed.has('selected')) {
+      socket.send(JSON.stringify({ type: 'viewing', guid: state.selected, editing: state.editing }));
+    }
+    if (changed.has('editing')) {
+      socket.send(JSON.stringify({ type: 'editing', editing: state.editing }));
     }
   });
 }
@@ -23,8 +28,8 @@ function connect(): void {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   socket = new WebSocket(`${proto}://${location.host}/api/ws?user=${user}`);
   socket.onopen = () => {
-    const sel = store.get().selected;
-    if (sel) socket?.send(JSON.stringify({ type: 'viewing', guid: sel }));
+    const { selected, editing } = store.get();
+    if (selected) socket?.send(JSON.stringify({ type: 'viewing', guid: selected, editing }));
   };
   socket.onmessage = (ev) => {
     try {
@@ -63,9 +68,17 @@ function handle(msg: SessionMessage): void {
     case 'workflow-transition':
     case 'artifact-updated':
       if (e.guid && e.guid === store.get().selected) {
-        // Concurrent editing notification: another session changed the
-        // artifact currently open here.
-        refreshDetail();
+        // Another session changed the artifact currently open here. Reload
+        // to show the change — but not while there are unsaved local edits,
+        // which a reload would silently discard. In that case keep the edits
+        // and warn; saving will surface the conflict (409) to resolve.
+        if (store.get().editing) {
+          store.update({
+            notice: 'This artifact was changed by another session. Your unsaved edits are kept — save to attempt to apply them, or discard to reload.',
+          });
+        } else {
+          refreshDetail();
+        }
       }
       loadTree();
       break;

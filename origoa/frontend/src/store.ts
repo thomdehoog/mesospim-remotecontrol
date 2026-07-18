@@ -31,6 +31,7 @@ export interface AppState {
   // Transient session state
   presence: PresenceEntry[];
   maintenance: boolean;
+  editing: boolean;        // the open artifact has unsaved local edits
   notice: string;          // transient notification banner
   error: string;
   loading: boolean;
@@ -53,6 +54,7 @@ const initial: AppState = {
   status: null,
   presence: [],
   maintenance: false,
+  editing: false,
   notice: '',
   error: '',
   loading: false,

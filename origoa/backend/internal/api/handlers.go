@@ -34,8 +34,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
+	// The reindex outlives this request, so it must not run on the request
+	// context (cancelled the moment the handler returns). It is tied to the
+	// server lifetime instead, so it still stops on graceful shutdown.
 	go func() {
-		if err := s.Svc.Reindex(r.Context()); err != nil {
+		if err := s.Svc.Reindex(s.baseContext()); err != nil {
 			s.Hub.BroadcastEvent(repo.Event{Type: "reindex-failed", Detail: err.Error()})
 		}
 	}()
@@ -413,6 +416,24 @@ func (s *Server) handleCreateLink(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"guid": guid})
 }
 
+func (s *Server) handleUpdateLink(w http.ResponseWriter, r *http.Request) {
+	p, ok := readBody[repo.UpdateLinkParams](w, r)
+	if !ok {
+		return
+	}
+	guid := r.PathValue("guid")
+	if err := s.Svc.UpdateLink(r.Context(), guid, p); err != nil {
+		writeErr(w, err)
+		return
+	}
+	row, err := s.Svc.DB.GetArtifact(r.Context(), guid)
+	if err != nil || row == nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, artifactJSON(row))
+}
+
 func (s *Server) handleCreateComment(w http.ResponseWriter, r *http.Request) {
 	p, ok := readBody[repo.CreateCommentParams](w, r)
 	if !ok {
@@ -424,6 +445,24 @@ func (s *Server) handleCreateComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"guid": guid})
+}
+
+func (s *Server) handleUpdateComment(w http.ResponseWriter, r *http.Request) {
+	p, ok := readBody[repo.UpdateCommentParams](w, r)
+	if !ok {
+		return
+	}
+	guid := r.PathValue("guid")
+	if err := s.Svc.UpdateComment(r.Context(), guid, p); err != nil {
+		writeErr(w, err)
+		return
+	}
+	row, err := s.Svc.DB.GetArtifact(r.Context(), guid)
+	if err != nil || row == nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, artifactJSON(row))
 }
 
 // ---- Folder operations ----
