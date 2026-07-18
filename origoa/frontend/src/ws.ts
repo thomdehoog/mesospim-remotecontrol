@@ -82,6 +82,16 @@ function handle(msg: SessionMessage): void {
       }
       loadTree();
       break;
+    case 'link-created':
+    case 'link-updated':
+    case 'comment-created':
+    case 'comment-updated':
+      // A relationship or comment changed: the open artifact's panels may
+      // show it. Refresh the detail view (unless local edits are unsaved,
+      // which a refresh would discard).
+      if (store.get().selected && !store.get().editing) refreshDetail();
+      loadTree();
+      break;
     default:
       // Repository changed: refresh the navigation context.
       loadTree();

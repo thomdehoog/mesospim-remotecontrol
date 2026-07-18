@@ -54,19 +54,34 @@ export class ArtifactDetailView extends StoreElement {
       padding: 2px 8px; border-radius: 10px; }
   `;
 
-  render() {
+  // willUpdate keeps the derived edit state in sync before each render:
+  // stale edits are dropped when a different artifact/revision loads, and the
+  // "unsaved edits" flag is mirrored into the store (so the session client can
+  // broadcast editing presence and preserve local edits on a remote change).
+  // Doing this here rather than in render() keeps render() a pure function of
+  // state. This element does not observe 'editing', so the store write never
+  // re-enters its own update cycle.
+  protected willUpdate(): void {
     const d = this.app.detail;
-    if (!d) return nothing;
+    if (!d) {
+      if (this.app.editing) store.update({ editing: false });
+      return;
+    }
     if (this.pendingFor !== d.guid + d.updatedCommit) {
-      // A different artifact (or revision) was loaded: drop stale edits.
       this.pending = {};
       this.pendingTitle = null;
       this.pendingFor = d.guid + d.updatedCommit;
     }
+    const dirty = Object.keys(this.pending).length > 0 || this.pendingTitle !== null;
+    if (this.app.editing !== dirty) store.update({ editing: dirty });
+  }
+
+  render() {
+    const d = this.app.detail;
+    if (!d) return nothing;
     const schema = d.schema;
     const resolved = d.resolved;
     const dirty = Object.keys(this.pending).length > 0 || this.pendingTitle !== null;
-    this.publishEditing(dirty);
     const others = this.app.presence.filter((p) => p.viewing === d.guid).length - 1;
     return html`
       <div class="head">
@@ -150,15 +165,6 @@ export class ArtifactDetailView extends StoreElement {
         <button class="danger" @click=${this.removeArtifact}>Delete</button>
       </div>
     `;
-  }
-
-  // publishEditing mirrors this view's unsaved-edit state into the store so
-  // the session client can broadcast editing presence and so an incoming
-  // remote change to the same artifact preserves (rather than discards) the
-  // local edits. This element does not observe 'editing', so the update
-  // never re-enters its own render.
-  private publishEditing(dirty: boolean): void {
-    if (this.app.editing !== dirty) store.update({ editing: dirty });
   }
 
   disconnectedCallback(): void {

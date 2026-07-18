@@ -438,10 +438,7 @@ func (s *Service) reconstructHIDHistory(ctx context.Context, tx pgx.Tx, head plu
 			if ch.Action == gitstore.Deleted {
 				continue
 			}
-			cl := cfg.Classify(ch.Path)
-			isArtifact := cl.Class == scanner.ArtifactFile ||
-				(cl.Class == scanner.ConfigObjectFile && (cl.Category == "links" || cl.Category == "comments"))
-			if !isArtifact {
+			if !isArtifactPath(cfg, ch.Path) {
 				continue
 			}
 			content, ok, err := s.Git.ReadBlob(h, ch.Path)
@@ -529,6 +526,15 @@ func (s *Service) rebuildFTS(ctx context.Context, tx pgx.Tx) error {
 	return nil
 }
 
+// isArtifactPath reports whether a repository path holds a native artifact:
+// an entry/document GUID file, or a link/comment metadata object. Shared by
+// the two Git-history passes (HID reconstruction and the deletion scan).
+func isArtifactPath(cfg scanner.Config, p string) bool {
+	cl := cfg.Classify(p)
+	return cl.Class == scanner.ArtifactFile ||
+		(cl.Class == scanner.ConfigObjectFile && (cl.Category == "links" || cl.Category == "comments"))
+}
+
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
@@ -572,10 +578,7 @@ func (s *Service) historyScan(ctx context.Context, tx pgx.Tx, head plumbing.Hash
 			if ch.Action != gitstore.Deleted {
 				continue
 			}
-			cl := cfg.Classify(ch.Path)
-			isArtifact := cl.Class == scanner.ArtifactFile ||
-				(cl.Class == scanner.ConfigObjectFile && (cl.Category == "links" || cl.Category == "comments"))
-			if !isArtifact {
+			if !isArtifactPath(cfg, ch.Path) {
 				continue
 			}
 			content, ok, err := s.Git.ReadBlob(parent, ch.Path)
