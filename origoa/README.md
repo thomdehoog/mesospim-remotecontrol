@@ -109,6 +109,15 @@ executes injected script and always degrades gracefully. Untrusted rich-text
 and document HTML is passed through a small sanitizer (`src/sanitize.ts`)
 before rendering.
 
+A whole-system chaos suite (`npm run test:chaos`) shakes every layer at once:
+a live browser session drives the SPA while concurrent API clients hammer
+writes and repeated reindexing churns the projection underneath it. It asserts
+the end-to-end invariants only a full-stack test can reach — the WebSocket
+delivers live UI updates, no artifact is lost across the compare-and-swap, the
+UI reflects backend truth, and, the clincher, the live projection equals a
+from-scratch Git rebuild observed through the HTTP API (which would diverge if
+a write ever leaked into a concurrent reindex).
+
 ## API sketch
 
 Artifact APIs: `POST /api/entries|documents|links|comments`,
