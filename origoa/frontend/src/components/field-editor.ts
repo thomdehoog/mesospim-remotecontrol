@@ -5,6 +5,7 @@
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import type { FieldDef } from '../types';
+import { sanitizeHTML } from '../sanitize';
 
 @customElement('origoa-field')
 export class FieldEditor extends LitElement {
@@ -101,7 +102,7 @@ export class FieldEditor extends LitElement {
         return html`<textarea .value=${String(v ?? '')}
           @change=${(e: Event) => this.emit((e.target as HTMLTextAreaElement).value)}></textarea>`;
       case 'richtext':
-        return html`<div class="rich" contenteditable="true" .innerHTML=${String(v ?? '')}
+        return html`<div class="rich" contenteditable="true" .innerHTML=${sanitizeHTML(String(v ?? ''))}
           @blur=${(e: Event) => this.emit((e.target as HTMLElement).innerHTML)}></div>`;
       case 'hyperlink':
         return html`<input type="url" placeholder="https://…" .value=${String(v ?? '')}

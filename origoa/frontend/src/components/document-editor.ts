@@ -10,6 +10,7 @@ import { api } from '../api';
 import { errText, notify, refreshDetail, loadTree, selectArtifact } from '../actions';
 import { store } from '../store';
 import type { DocBlock, DocSection } from '../types';
+import { sanitizeHTML } from '../sanitize';
 import './panels';
 
 interface RefInfo { title: string; hid: string; type: string }
@@ -194,7 +195,7 @@ export class DocumentEditor extends StoreElement {
         </div>`;
       default:
         return html`<div class="block">
-          <div class="text" contenteditable="true" .innerHTML=${b.text ?? ''}
+          <div class="text" contenteditable="true" .innerHTML=${sanitizeHTML(b.text ?? '')}
             @input=${(e: Event) => { b.text = (e.target as HTMLElement).innerHTML; this.touch(); }}></div>
           ${tools}
         </div>`;

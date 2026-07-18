@@ -101,6 +101,14 @@ Tests (`go test ./...`) expect a scratch database at
 `postgres://origoa:origoa@localhost:5432/origoa_test` (override with
 `ORIGOA_TEST_DSN`); Postgres-dependent tests skip when it is unreachable.
 
+The frontend ships an adversarial suite (`npm run test:adversarial` from
+`frontend/`, against a running server) that drives the SPA through stored-XSS
+payloads, malformed deep links, hostile field input, an optimistic-concurrency
+conflict, reindex-while-browsing and rapid navigation, asserting the app never
+executes injected script and always degrades gracefully. Untrusted rich-text
+and document HTML is passed through a small sanitizer (`src/sanitize.ts`)
+before rendering.
+
 ## API sketch
 
 Artifact APIs: `POST /api/entries|documents|links|comments`,
