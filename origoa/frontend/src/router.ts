@@ -4,7 +4,10 @@
 
 import { store, navKeys, type AppState } from './store';
 
-function stateToURL(s: AppState): string {
+// stateToURL and urlToState are pure and inverse: they define the mapping
+// between navigable application state and the browser URL. Kept exported and
+// side-effect-free so the round trip can be unit tested directly.
+export function stateToURL(s: AppState): string {
   const qs = new URLSearchParams();
   if (s.path) qs.set('path', s.path);
   if (s.selected) qs.set('sel', s.selected);
@@ -17,8 +20,8 @@ function stateToURL(s: AppState): string {
   return str ? `/?${str}` : '/';
 }
 
-function urlToState(): Partial<AppState> {
-  const qs = new URLSearchParams(location.search);
+export function urlToState(search: string = location.search): Partial<AppState> {
+  const qs = new URLSearchParams(search);
   return {
     path: qs.get('path') ?? '',
     selected: qs.get('sel') ?? '',
@@ -36,7 +39,7 @@ export function initRouter(): void {
   // URL → store on load and on back/forward navigation.
   const apply = () => {
     applyingURL = true;
-    store.update(urlToState());
+    store.update(urlToState(location.search));
     applyingURL = false;
   };
   window.addEventListener('popstate', apply);

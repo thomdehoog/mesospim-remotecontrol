@@ -97,26 +97,28 @@ ORIGOA_STATIC=../frontend/dist go run ./cmd/origoad   # http://localhost:8000
 Environment overrides: `ORIGOA_DSN`, `ORIGOA_GIT_DIR`, `ORIGOA_LISTEN`,
 `ORIGOA_STATIC`; or pass `-config origoa.json`.
 
-Tests (`go test ./...`) expect a scratch database at
-`postgres://origoa:origoa@localhost:5432/origoa_test` (override with
-`ORIGOA_TEST_DSN`); Postgres-dependent tests skip when it is unreachable.
+## Tests
 
-The frontend ships an adversarial suite (`npm run test:adversarial` from
-`frontend/`, against a running server) that drives the SPA through stored-XSS
-payloads, malformed deep links, hostile field input, an optimistic-concurrency
-conflict, reindex-while-browsing and rapid navigation, asserting the app never
-executes injected script and always degrades gracefully. Untrusted rich-text
-and document HTML is passed through a small sanitizer (`src/sanitize.ts`)
-before rendering.
+The suite is a ladder — unit → integration → adversarial — across both the
+backend and the frontend, documented in full in [TESTING.md](TESTING.md):
 
-A whole-system chaos suite (`npm run test:chaos`) shakes every layer at once:
-a live browser session drives the SPA while concurrent API clients hammer
-writes and repeated reindexing churns the projection underneath it. It asserts
-the end-to-end invariants only a full-stack test can reach — the WebSocket
-delivers live UI updates, no artifact is lost across the compare-and-swap, the
-UI reflects backend truth, and, the clincher, the live projection equals a
-from-scratch Git rebuild observed through the HTTP API (which would diverge if
-a write ever leaked into a concurrent reindex).
+```bash
+cd backend  && go test -p 1 ./...          # backend unit + integration + torture/fuzz
+cd frontend && npm run test:unit           # frontend pure logic (vitest + jsdom)
+#   with a running, freshly seeded server:
+cd frontend && npm run test:integration    # happy-path end-to-end
+              npm run test:adversarial     # stored-XSS, malformed URLs, hostile input, conflicts
+              npm run test:chaos           # whole-system: live UI + concurrent writers + reindex
+```
+
+Backend DB-backed tests use a scratch database (`ORIGOA_TEST_DSN`, default
+`postgres://origoa:origoa@localhost:5432/origoa_test`) and skip when it is
+unreachable; `-p 1` serializes packages that share it. The adversarial and
+whole-system tiers prove the guarantees hold under hostile input and
+concurrency — Git stays authoritative, the projection always equals a
+from-scratch rebuild, and neither layer can be broken into losing data or
+executing injected script. Untrusted rich-text and document HTML is passed
+through a small sanitizer (`src/sanitize.ts`) before rendering.
 
 ## API sketch
 

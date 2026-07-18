@@ -61,7 +61,9 @@ const initial: AppState = {
 
 type Listener = (state: AppState, changed: Set<keyof AppState>) => void;
 
-class Store {
+// Store is exported (not just its singleton) so tests can exercise isolated
+// instances without sharing global state.
+export class Store {
   private state: AppState = { ...initial };
   private listeners = new Set<Listener>();
 
