@@ -33,7 +33,7 @@ than fail.
 |---|---|---|
 | **Unit** | `ojson`, `schemamodel`, `artifact`, `config`, `scanner`, `projection` (`encode_test.go`) | Order-preserving JSON, schema composition & workflow rules, artifact parsing/search-text, config loading, path classification, ltree encoding and NUL/oversize sanitization — pure, no DB |
 | **Integration** | `gitstore`, `resolve`, `repo`, `api` | Git plumbing against a real repo; lexical schema/workflow resolution, the full repository update transaction, CRUD, overlays, HID history and reindex against Postgres; the REST API over HTTP |
-| **Adversarial** | `repo/torture_test.go`, `*/fuzz_test.go` | Concurrent mixed-operation torture under a live reindex, two processes sharing one repository, foreign-commit drift, hostile payloads, projection-never-wedges; fuzzers for JSON round-trip, path classification, folder cleaning and input sanitization |
+| **Adversarial** | `repo/torture_test.go`, `*/fuzz_test.go` | Concurrent mixed-operation torture under a live reindex, two processes sharing one repository, foreign-commit drift, hostile payloads, projection-never-wedges, concurrent relationship-cardinality races (atomic under CAS retry), link/comment update conflicts and hostile-input survival across a reindex; fuzzers for JSON round-trip, path classification, folder cleaning and input sanitization |
 
 Run one rung or target explicitly:
 

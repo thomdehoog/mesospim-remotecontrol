@@ -450,3 +450,104 @@ func TestUnknownPropertiesSurviveUpdate(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// TestConcurrentCardinalityHolds proves the relationship cardinality bound is
+// enforced atomically. Many workers race to create a many-to-one "parent"
+// link out of the SAME source; because validation runs inside the update
+// transaction and is re-checked on every compare-and-swap retry, exactly one
+// may win — a stale pre-transaction count can never let two through.
+func TestConcurrentCardinalityHolds(t *testing.T) {
+	s, ctx := newService(t)
+	seedConfig(t, s, ctx) // "parent" is many-to-one (source may have one)
+
+	source, err := s.CreateArtifact(ctx, CreateArtifactParams{
+		Kind: "entry", Folder: "reqs", Type: "requirement", Title: "source"})
+	must(t, err)
+	const racers = 8
+	targets := make([]string, racers)
+	for i := range targets {
+		g, e := s.CreateArtifact(ctx, CreateArtifactParams{
+			Kind: "entry", Folder: "reqs", Type: "requirement", Title: fmt.Sprintf("t%d", i)})
+		must(t, e)
+		targets[i] = g
+	}
+
+	var success, rejected atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(target string) {
+			defer wg.Done()
+			err := retryWrite(func() error {
+				_, e := s.CreateLink(ctx, CreateLinkParams{Type: "parent", Source: source, Target: target})
+				return e
+			})
+			switch {
+			case err == nil:
+				success.Add(1)
+			case errors.As(err, new(ErrValidation)):
+				rejected.Add(1) // cardinality correctly refused the extra link
+			default:
+				t.Errorf("unexpected error racing link: %v", err)
+			}
+		}(targets[i])
+	}
+	wg.Wait()
+
+	if success.Load() != 1 {
+		t.Fatalf("many-to-one cardinality breached: %d links committed, want exactly 1", success.Load())
+	}
+	if rejected.Load() != racers-1 {
+		t.Fatalf("expected %d rejections, got %d", racers-1, rejected.Load())
+	}
+	// Ground truth: the projection holds exactly one outgoing parent link.
+	links, err := s.DB.LinksFor(ctx, source)
+	must(t, err)
+	out := 0
+	for _, l := range links {
+		if l.Type == "parent" && l.Source == source {
+			out++
+		}
+	}
+	if out != 1 {
+		t.Fatalf("projection shows %d outgoing parent links, want 1", out)
+	}
+}
+
+// TestUpdateLinkCommentConflictAndReindex exercises the link/comment update
+// paths adversarially: optimistic-concurrency conflicts are detected, hostile
+// text is stored without wedging the projection, and both survive a reindex.
+func TestUpdateLinkCommentConflictAndReindex(t *testing.T) {
+	s, ctx := newService(t)
+	seedConfig(t, s, ctx)
+	a, _ := s.CreateArtifact(ctx, CreateArtifactParams{Kind: "entry", Folder: "x", Type: "requirement", Title: "A"})
+	b, _ := s.CreateArtifact(ctx, CreateArtifactParams{Kind: "entry", Folder: "x", Type: "testcase", Title: "B"})
+	link, err := s.CreateLink(ctx, CreateLinkParams{Type: "satisfies", Source: a, Target: b})
+	must(t, err)
+	comment, err := s.CreateComment(ctx, CreateCommentParams{Subject: a, Text: "original"})
+	must(t, err)
+
+	// A stale revision is rejected on both update paths.
+	if err := s.UpdateLink(ctx, link, UpdateLinkParams{Fields: map[string]any{"w": "1"}, IfRevision: "deadbeef"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale link update: want conflict, got %v", err)
+	}
+	if err := s.UpdateComment(ctx, comment, UpdateCommentParams{Text: strPtr("x"), IfRevision: "deadbeef"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale comment update: want conflict, got %v", err)
+	}
+
+	// Hostile content through the update paths must not wedge the projection.
+	hostile := "edit\x00" + strings.Repeat("spike ", 200_000)
+	must(t, s.UpdateLink(ctx, link, UpdateLinkParams{Fields: map[string]any{"note": hostile}}))
+	must(t, s.UpdateComment(ctx, comment, UpdateCommentParams{Text: strPtr(hostile)}))
+
+	// Both survive a from-scratch rebuild.
+	before := listingOf(t, s, ctx)
+	must(t, s.Reindex(ctx))
+	diffListings(t, "post-update live vs rebuild", before, listingOf(t, s, ctx))
+	if row, _ := s.DB.GetArtifact(ctx, link); row == nil {
+		t.Fatal("link vanished after reindex")
+	}
+	if row, _ := s.DB.GetArtifact(ctx, comment); row == nil {
+		t.Fatal("comment vanished after reindex")
+	}
+}
