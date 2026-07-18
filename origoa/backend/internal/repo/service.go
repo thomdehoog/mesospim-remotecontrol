@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -379,15 +380,21 @@ func (s *Service) Reindex(ctx context.Context) error {
 	}
 
 	// Phase 2 — GUID recognition and field indexing (one tree traversal).
+	// Full-text indexing is deferred: the tree pass skips the per-artifact
+	// full-text write so phase 3 can rebuild it in one bulk, parallel pass.
 	s.setProgress("guid-recognition", "rebuilding GUID translation and field index")
 	if !head.IsZero() {
-		if err := s.Scanner.ProjectTree(ctx, tx, head); err != nil {
+		if err := s.Scanner.ProjectTree(scanner.WithDeferredFTS(ctx), tx, head); err != nil {
 			return err
 		}
 	}
 
-	// Phase 3 — recreate the full-text index in bulk.
-	s.setProgress("fulltext", "building full-text index")
+	// Phase 3 — rebuild full text in bulk with parallel workers, then
+	// recreate the GIN index (which PostgreSQL also builds in parallel).
+	s.setProgress("fulltext", "rebuilding full-text index")
+	if err := s.rebuildFTS(ctx, tx); err != nil {
+		return err
+	}
 	if err := s.DB.CreateFTSIndex(ctx, tx); err != nil {
 		return err
 	}
@@ -452,6 +459,71 @@ func (s *Service) reconstructHIDHistory(ctx context.Context, tx pgx.Tx, head plu
 				return err
 			}
 			lastHID[af.GUID] = af.HID
+		}
+	}
+	return nil
+}
+
+// ftsBatchSize bounds how many full-text documents are written per
+// set-based insert during the bulk reindex.
+const ftsBatchSize = 1000
+
+// rebuildFTS rebuilds the full-text projection in bulk. The CPU-bound work —
+// parsing each artifact's stored JSON and deriving its search text — is
+// spread across worker goroutines (the "parallel Go workers" the reindex
+// algorithm prescribes); the derived documents are then written in batched,
+// set-based inserts so PostgreSQL computes the tsvectors server-side. It runs
+// on the reindex transaction with the GIN index dropped, so the whole rebuild
+// stays atomic with the rest of the reindex.
+func (s *Service) rebuildFTS(ctx context.Context, tx pgx.Tx) error {
+	sources, err := s.DB.FTSSources(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if len(sources) == 0 {
+		return nil
+	}
+
+	docs := make([]projection.FTSDoc, len(sources))
+	workers := runtime.NumCPU()
+	if workers > 8 {
+		workers = 8
+	}
+	if workers > len(sources) {
+		workers = len(sources)
+	}
+	chunk := (len(sources) + workers - 1) / workers
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		lo := w * chunk
+		hi := lo + chunk
+		if hi > len(sources) {
+			hi = len(sources)
+		}
+		if lo >= hi {
+			break
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			for i := lo; i < hi; i++ {
+				text := ""
+				if af, err := parseArtifact(sources[i].Content); err == nil {
+					text = af.SearchText()
+				}
+				docs[i] = projection.FTSDoc{GUID: sources[i].GUID, Text: text}
+			}
+		}(lo, hi)
+	}
+	wg.Wait()
+
+	for lo := 0; lo < len(docs); lo += ftsBatchSize {
+		hi := lo + ftsBatchSize
+		if hi > len(docs) {
+			hi = len(docs)
+		}
+		if err := s.DB.UpsertFTSBatch(ctx, tx, docs[lo:hi]); err != nil {
+			return err
 		}
 	}
 	return nil

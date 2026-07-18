@@ -60,6 +60,24 @@ func ParseConfig(b []byte) (Config, error) {
 	return c, nil
 }
 
+// ctxKey is the private type for scanner context values.
+type ctxKey int
+
+const deferFTSKey ctxKey = iota
+
+// WithDeferredFTS marks a projection pass (the reindex tree traversal) as
+// deferring full-text indexing: indexers skip the per-artifact full-text
+// write so the reindex can rebuild it in one bulk, parallel pass instead.
+func WithDeferredFTS(ctx context.Context) context.Context {
+	return context.WithValue(ctx, deferFTSKey, true)
+}
+
+// FTSDeferred reports whether full-text indexing is deferred for this pass.
+func FTSDeferred(ctx context.Context) bool {
+	v, _ := ctx.Value(deferFTSKey).(bool)
+	return v
+}
+
 // PathClass describes how the scanner classifies one repository path.
 type PathClass int
 

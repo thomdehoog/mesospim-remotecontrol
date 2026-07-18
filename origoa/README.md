@@ -58,8 +58,9 @@ retry) → update `processed_hash` → release the mutex → commit. Direct Git
 pushes from external tooling are picked up by replay; if incremental replay
 is impossible the backend falls back to a full reindex (history
 reconstruction of the complete HID history → GUID recognition → field
-indexing → bulk full-text rebuild with the GIN index dropped and recreated →
-history scan for deleted artifacts). Because the reindex walks Git history to
+indexing → bulk full-text rebuild — parallel workers derive the search text,
+the GIN index is dropped and recreated, and `maintenance_work_mem` is raised
+for the build → history scan for deleted artifacts). Because the reindex walks Git history to
 rebuild the identifier history, no derived data — including every HID ever
 assigned and the commit that assigned it — is lost across a rebuild. A
 background loop also continuously synchronizes the projection, so commits

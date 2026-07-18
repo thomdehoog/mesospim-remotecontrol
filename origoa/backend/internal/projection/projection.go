@@ -227,6 +227,64 @@ func (db *DB) UpsertFTS(ctx context.Context, tx pgx.Tx, guid, text string) error
 	return err
 }
 
+// FTSDoc is one artifact's full-text source, produced by the reindex's
+// parallel workers and written in bulk by UpsertFTSBatch.
+type FTSDoc struct {
+	GUID string
+	Text string
+}
+
+// UpsertFTSBatch inserts a batch of full-text documents in a single
+// set-based statement: PostgreSQL computes every tsvector server-side (a
+// parallelizable query) instead of one round-trip per artifact. Each text
+// is clamped/sanitized exactly as UpsertFTS does. Used by the bulk reindex.
+func (db *DB) UpsertFTSBatch(ctx context.Context, tx pgx.Tx, docs []FTSDoc) error {
+	if len(docs) == 0 {
+		return nil
+	}
+	guids := make([]string, len(docs))
+	texts := make([]string, len(docs))
+	for i, d := range docs {
+		guids[i] = d.GUID
+		texts[i] = clampFTS(d.Text)
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO fts (guid, tsv)
+		SELECT g::uuid, to_tsvector('simple', t)
+		FROM unnest($1::text[], $2::text[]) AS u(g, t)
+		ON CONFLICT (guid) DO UPDATE SET tsv=EXCLUDED.tsv`, guids, texts)
+	return err
+}
+
+// ArtifactFTSSource is one row of raw content the reindex reads to rebuild
+// full text from the projected artifacts (excluding links, which carry no
+// searchable prose).
+type ArtifactFTSSource struct {
+	GUID    string
+	Content []byte
+}
+
+// FTSSources streams the artifacts that need a full-text document (every
+// kind except links) from the projected table, for the bulk reindex.
+func (db *DB) FTSSources(ctx context.Context, tx pgx.Tx) ([]ArtifactFTSSource, error) {
+	rows, err := tx.Query(ctx, `SELECT guid::text, content::text FROM artifacts WHERE kind <> 'link'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ArtifactFTSSource
+	for rows.Next() {
+		var s ArtifactFTSSource
+		var content string
+		if err := rows.Scan(&s.GUID, &content); err != nil {
+			return nil, err
+		}
+		s.Content = []byte(content)
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 // UpsertLinkIndex writes the link summary row.
 func (db *DB) UpsertLinkIndex(ctx context.Context, tx pgx.Tx, guid, typ, source, target string) error {
 	_, err := tx.Exec(ctx, `

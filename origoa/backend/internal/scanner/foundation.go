@@ -99,6 +99,10 @@ func (f *FoundationIndexer) upsertArtifact(ctx context.Context, tx pgx.Tx, af *a
 		// would pollute full-text results.
 		return nil
 	}
+	if FTSDeferred(ctx) {
+		// The reindex rebuilds full text in one bulk, parallel pass.
+		return nil
+	}
 	return f.DB.UpsertFTS(ctx, tx, af.GUID, af.SearchText())
 }
 

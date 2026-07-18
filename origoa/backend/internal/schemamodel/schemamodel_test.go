@@ -67,6 +67,37 @@ func TestInheritanceOff(t *testing.T) {
 	}
 }
 
+func TestPresentationReplacedWholesale(t *testing.T) {
+	root := mustParse(t, `{"artifactType": "x", "presentation": {"color": "blue", "icon": "star"}}`)
+	local := mustParse(t, `{"artifactType": "x", "presentation": {"color": "red"}}`)
+	eff := Compose("x", []Contribution{
+		{StoragePath: "root", Schema: root},
+		{StoragePath: "sub", Schema: local},
+	})
+	// The specialized presentation replaces the inherited one entirely: the
+	// root's "icon" key must not leak through.
+	if eff.Presentation["color"] != "red" {
+		t.Fatalf("specialized presentation did not win: %+v", eff.Presentation)
+	}
+	if _, leaked := eff.Presentation["icon"]; leaked {
+		t.Fatalf("inherited presentation key leaked through wholesale replace: %+v", eff.Presentation)
+	}
+}
+
+func TestUnknownFieldTypeRejected(t *testing.T) {
+	if _, err := ParseSchemaFile([]byte(`{"artifactType":"x","fields":[{"id":"a","type":"nonsense"}]}`)); err == nil {
+		t.Fatal("schema with an unknown field type was accepted")
+	}
+	// "workflow" is not a field type (workflow participation is schema-level).
+	if _, err := ParseSchemaFile([]byte(`{"artifactType":"x","fields":[{"id":"a","type":"workflow"}]}`)); err == nil {
+		t.Fatal("schema with a workflow field type was accepted")
+	}
+	// A field without an id is malformed.
+	if _, err := ParseSchemaFile([]byte(`{"artifactType":"x","fields":[{"type":"text"}]}`)); err == nil {
+		t.Fatal("schema with an id-less field was accepted")
+	}
+}
+
 func TestWorkflowDef(t *testing.T) {
 	wd, err := ParseWorkflowDef([]byte(`{
 		"name": "review", "initial": "draft",

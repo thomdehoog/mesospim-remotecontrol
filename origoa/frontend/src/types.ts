@@ -75,7 +75,7 @@ export interface EffectiveSchema {
   fields: FieldDef[];
   workflows: string[];
   relationships: RelationshipDef[];
-  enums?: Record<string, { values: string[]; extendable?: boolean }>;
+  enums?: Record<string, { values: string[]; multiple?: boolean }>;
   presentation?: Record<string, unknown>;
   sources: string[];
 }

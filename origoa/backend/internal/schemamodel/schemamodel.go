@@ -33,16 +33,18 @@ const (
 	FieldArtifacts  = "artifacts" // multi artifact reference
 	FieldAttachment = "attachment"
 	FieldObject     = "object" // JSON object
-	FieldWorkflow   = "workflow"
 )
 
-// ValidFieldTypes enumerates the stable set of generic field types.
+// ValidFieldTypes enumerates the stable set of generic field types the
+// Foundation defines. Workflow participation is assigned at the schema level
+// (the Workflows list), not through a field type, so "workflow" is
+// deliberately absent.
 var ValidFieldTypes = map[string]bool{
 	FieldHID: true, FieldBoolean: true, FieldInteger: true, FieldFloat: true,
 	FieldCurrency: true, FieldDate: true, FieldTime: true, FieldDateTime: true,
 	FieldText: true, FieldMultiText: true, FieldRichText: true, FieldEnum: true,
 	FieldHyperlink: true, FieldArtifact: true, FieldArtifacts: true,
-	FieldAttachment: true, FieldObject: true, FieldWorkflow: true,
+	FieldAttachment: true, FieldObject: true,
 }
 
 // FieldDef describes one schema-defined artifact field.
@@ -68,11 +70,13 @@ type RelationshipDef struct {
 	Fields      []FieldDef `json:"fields,omitempty"`
 }
 
-// EnumDef is a named enumeration definition.
+// EnumDef is a named enumeration definition. The MVP supports static,
+// user-defined value lists; enumeration values generated from repository
+// artifacts or by extensions, and user-extendable enumerations, are part of
+// the (non-MVP) extension model and are intentionally not advertised here.
 type EnumDef struct {
-	Values     []string `json:"values"`
-	Extendable bool     `json:"extendable,omitempty"`
-	Multiple   bool     `json:"multiple,omitempty"`
+	Values   []string `json:"values"`
+	Multiple bool     `json:"multiple,omitempty"`
 }
 
 // SchemaFile is the persisted form of one schema definition inside a
@@ -119,7 +123,30 @@ func ParseSchemaFile(content []byte) (*SchemaFile, error) {
 	if sf.Kind == "" {
 		sf.Kind = "entry"
 	}
+	// Field types must belong to the Foundation's defined vocabulary. An
+	// unknown type is a malformed schema; resolution skips such schemas
+	// rather than composing a field the UI cannot render.
+	if err := validateFieldTypes(sf.Fields); err != nil {
+		return nil, err
+	}
+	for _, r := range sf.Relationships {
+		if err := validateFieldTypes(r.Fields); err != nil {
+			return nil, err
+		}
+	}
 	return &sf, nil
+}
+
+func validateFieldTypes(fields []FieldDef) error {
+	for _, f := range fields {
+		if f.ID == "" {
+			return fmt.Errorf("schema: field missing id")
+		}
+		if !ValidFieldTypes[f.Type] {
+			return fmt.Errorf("schema: field %q has unknown type %q", f.ID, f.Type)
+		}
+	}
+	return nil
 }
 
 // Contribution pairs a parsed schema with its storage path, ordered from
@@ -176,13 +203,13 @@ func Compose(artifactType string, contributions []Contribution) *EffectiveSchema
 		for name, e := range s.Enums {
 			eff.Enums[name] = e // most specialized definition replaces
 		}
+		// Presentation metadata is replaced completely by a more specialized
+		// definition, not merged key-by-key: the spec applies the single
+		// "most specialized definition takes precedence" rule uniformly,
+		// including presentation. A schema that defines presentation at all
+		// supersedes any inherited presentation wholesale.
 		if s.Presentation != nil {
-			if eff.Presentation == nil {
-				eff.Presentation = map[string]any{}
-			}
-			for k, v := range s.Presentation {
-				eff.Presentation[k] = v
-			}
+			eff.Presentation = s.Presentation
 		}
 	}
 	if eff.Fields == nil {
