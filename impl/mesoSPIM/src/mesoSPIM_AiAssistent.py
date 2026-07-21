@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 _TERMINAL = {COMPLETED, FAILED}
 
+# Commands embedded in the system prompt, so not worth exposing as tools (a call only re-fetches
+# what the model already has). get_manual is the whole command reference — large and static.
+_PROMPT_ONLY = {"get_manual"}
+
 
 def dispatch_and_wait(acceptor, name, args, kind, cancel, cfg=config):
     """Run one command and return a finished result. For WAIT commands the return always
@@ -86,15 +90,15 @@ def _tool_fn(acceptor, name, kind, cancel, on_call=None):
 
 
 def build_tools(acceptor, cancel, on_call=None):
-    """One untyped passthrough tool per command. The tool list IS COMMANDS — never
-    hand-maintained. Per-arg correctness comes from each command's accept() validator.
-    NOTE (bench risk #1): untyped args → nested commands may mis-fire; Tool.from_schema is
-    the upgrade if so."""
+    """One untyped passthrough tool per command, minus the prompt-only ones (get_manual is already in
+    the system prompt). The tool list otherwise IS COMMANDS — never hand-maintained. Per-arg
+    correctness comes from each command's accept() validator. NOTE (bench risk #1): untyped args →
+    nested commands may mis-fire; Tool.from_schema is the upgrade if so."""
     from pydantic_ai import Tool
     return [
         Tool(_tool_fn(acceptor, name, cmd.kind, cancel, on_call),
              takes_ctx=False, name=name, description=cmd.hint or name)
-        for name, cmd in COMMANDS.items()
+        for name, cmd in COMMANDS.items() if name not in _PROMPT_ONLY
     ]
 
 
@@ -197,7 +201,10 @@ class AssistantWorker(QtCore.QObject):
             self.cancel.clear()
             if self._agent is None:
                 self._agent = build_agent(self._acceptor, self.cancel, on_call=self._emit_tool)
-            result = self._run_with_retry(text)
+            # No whole-turn retry: FallbackModel already rolls a rate-limited/unavailable primary
+            # over to the fallback within one run, and retrying the turn would re-stream (and re-run)
+            # every tool call the first attempt already made.
+            result = self._agent.run_sync(text, message_history=self._history)
             self._history = result.all_messages()
             self.sig_reply.emit(result.output)
         except Exception as error:
@@ -209,19 +216,6 @@ class AssistantWorker(QtCore.QObject):
         """Called at the tool boundary (worker thread) as each command fires; the queued signal
         delivers it to the GUI so tool calls stream in live rather than all at the end of the turn."""
         self.sig_tool.emit(name, args)
-
-    def _run_with_retry(self, text, tries=3):
-        """Free-tier Flash models intermittently 503 (UNAVAILABLE) / 429 under load; retry
-        those with a short backoff before surfacing an error."""
-        for attempt in range(tries):
-            try:
-                return self._agent.run_sync(text, message_history=self._history)
-            except Exception as error:
-                transient = any(s in str(error) for s in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
-                if attempt < tries - 1 and transient:
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                raise
 
     def interrupt(self):
         """Stop a runaway turn: gate further dispatches (dispatch_and_wait checks cancel) and

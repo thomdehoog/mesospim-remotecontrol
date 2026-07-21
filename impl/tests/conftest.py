@@ -74,6 +74,7 @@ def _install_fake_pyqt5():
         QueuedConnection = 0
         DirectConnection = 1
         BlockingQueuedConnection = 3
+        ScrollBarAlwaysOn = 2
 
     class QMetaObject:
         @staticmethod
@@ -211,7 +212,13 @@ def _install_fake_pyqt5():
         def setLineWrapMode(self, _mode):
             pass
 
+        def setVerticalScrollBarPolicy(self, _policy):
+            pass
+
         def setMarkdown(self, text):
+            self._markdown = text
+
+        def setHtml(self, text):
             self._markdown = text
 
         def toMarkdown(self):
@@ -289,14 +296,28 @@ def _install_fake_pyqt5():
                         ("QMessageBox", QMessageBox)):
         setattr(qtwidgets, _name, _obj)
 
+    # --- minimal QtGui: just QTextDocument, so the AI Assistant tab can render Markdown -> HTML.
+    qtgui = types.ModuleType("PyQt5.QtGui")
+
+    class QTextDocument:
+        def setMarkdown(self, markdown):
+            self._markdown = markdown
+
+        def toHtml(self):
+            return "<body>" + getattr(self, "_markdown", "") + "</body>"
+
+    qtgui.QTextDocument = QTextDocument
+
     pyqt5 = types.ModuleType("PyQt5")
     pyqt5.QtCore = qtcore
     pyqt5.QtNetwork = qtnetwork
     pyqt5.QtWidgets = qtwidgets
+    pyqt5.QtGui = qtgui
     sys.modules["PyQt5"] = pyqt5
     sys.modules["PyQt5.QtCore"] = qtcore
     sys.modules["PyQt5.QtNetwork"] = qtnetwork
     sys.modules["PyQt5.QtWidgets"] = qtwidgets
+    sys.modules["PyQt5.QtGui"] = qtgui
 
 
 _install_fake_pyqt5()

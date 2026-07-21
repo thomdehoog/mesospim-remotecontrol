@@ -74,12 +74,15 @@ def test_wait_returns_still_running_past_cap():
     assert out["status"] == "still_running"
 
 
-def test_build_tools_covers_every_command():
+def test_build_tools_covers_commands_except_prompt_only():
     pytest.importorskip("pydantic_ai")
-    from mesoSPIM.src.mesoSPIM_AiAssistent import build_tools
+    from mesoSPIM.src.mesoSPIM_AiAssistent import build_tools, _PROMPT_ONLY
     from mesoSPIM.src.mesoSPIM_RemoteControl_Dispatcher import COMMANDS
     tools = build_tools(FakeAcceptor(), threading.Event())
-    assert len(tools) == len(COMMANDS)
+    names = {t.name for t in tools}
+    assert len(tools) == len(COMMANDS) - len(_PROMPT_ONLY)
+    assert "get_manual" not in names                            # in the system prompt, not a tool
+    assert "move_absolute" in names
 
 
 # --- the worker: turn, retry, tool-surfacing, interrupt (fake agent) ---
@@ -141,25 +144,6 @@ def test_run_turn_error_emits_sig_error(monkeypatch):
     worker.run_turn("go")
     assert errors and "boom" in errors[0]
     assert len(dones) == 1                                        # sig_done fires even on failure
-
-
-def test_retry_on_503_then_success(monkeypatch):
-    worker = AssistantWorker(FakeAcceptor())
-    transient = RuntimeError("status_code: 503 UNAVAILABLE")
-    worker._agent = FakeAgent(results=[FakeResult("ok")], errors=[transient, transient])
-    monkeypatch.setattr(ai.time, "sleep", lambda *_: None)
-    result = worker._run_with_retry("go")
-    assert result.output == "ok"
-    assert worker._agent.runs == 3                                # two 503s retried, third succeeds
-
-
-def test_retry_gives_up_on_non_transient(monkeypatch):
-    worker = AssistantWorker(FakeAcceptor())
-    worker._agent = FakeAgent(errors=[ValueError("bad request")])
-    monkeypatch.setattr(ai.time, "sleep", lambda *_: None)
-    with pytest.raises(ValueError):
-        worker._run_with_retry("go")
-    assert worker._agent.runs == 1                                # non-transient: no retry
 
 
 def test_interrupt_sets_cancel_and_stops():

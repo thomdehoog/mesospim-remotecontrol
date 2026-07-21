@@ -1,9 +1,10 @@
-"""The 'AI Assistant' tab: a chat transcript and an input line, styled like a coding-agent chat.
+"""The 'AI Assistant' tab: a chat transcript styled like a coding-agent chat.
 
-The transcript renders Markdown (the model's bold/lists come through), streams each tool call as it
-fires, and shows a 'working' status while a turn runs. Enter submits; the input disables during a
-turn (single-flight); Interrupt halts a runaway agent. The Acceptor is acquired lazily on first use
-— until then the Remote Control transports stay usable, and the two are mutually exclusive.
+Each turn is a bubble with a slightly lighter background: your question, then a mesoSPIM bubble that
+shows its header immediately and streams the commands it runs underneath, before the final Markdown
+answer. Enter submits; the input disables during a turn (single-flight); Interrupt halts a runaway
+agent. The Acceptor is acquired lazily on first use — until then the Remote Control transports stay
+usable, and the two are mutually exclusive.
 
 Maintainer (2026):
     Thom de Hoog
@@ -12,17 +13,26 @@ Maintainer (2026):
     thomdehoog@gmail.com
 """
 
-from PyQt5 import QtCore, QtWidgets
+import html as _htmllib
+
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .mesoSPIM_AiAssistent import AssistantWorker
 
+_BUBBLE = "#2b3b47"      # a shade lighter than the dark theme, so questions and answers stand out
+_DIM = "#9aa7b0"         # tool-call and note text
 
-def _md_escape(text):
-    """Escape Markdown-active characters so literal text (a user line, an error) is shown verbatim
-    instead of being reinterpreted as formatting."""
-    for ch in "\\`*_{}[]()#+-.!":
-        text = text.replace(ch, "\\" + ch)
-    return text
+
+def _md_to_html(markdown):
+    """Render Markdown to an HTML body fragment (the model's bold/lists/etc.) via Qt's own parser."""
+    doc = QtGui.QTextDocument()
+    doc.setMarkdown(markdown)
+    html = doc.toHtml()
+    lower = html.lower()
+    body, close = lower.find("<body"), lower.rfind("</body>")
+    if body == -1 or close == -1:
+        return _htmllib.escape(markdown)
+    return html[html.find(">", body) + 1:close].strip()
 
 
 class AiAssistentGUI(QtWidgets.QWidget):
@@ -34,7 +44,8 @@ class AiAssistentGUI(QtWidgets.QWidget):
         self.core = parent.core
         self.setObjectName("AiAssistentTabWidget")
         self._worker = None
-        self._log = []                                            # markdown blocks, oldest first
+        self._blocks = []       # finalized message HTML, oldest first
+        self._active = None     # in-progress mesoSPIM turn: {"tools": [...], "reply": str, "error": str}
         self._build_ui()
         index = parent.TabWidget.indexOf(parent.remote_control)   # RemoteControlGUI instance
         if index >= 0:
@@ -84,7 +95,8 @@ class AiAssistentGUI(QtWidgets.QWidget):
         self.output.setReadOnly(True)
         self.output.setObjectName("AiAssistentOutput")
         self.output.setFont(font)
-        self.output.setLineWrapMode(QtWidgets.QTextEdit.WidgetWidth)   # wrap; no horizontal scrollbar
+        self.output.setLineWrapMode(QtWidgets.QTextEdit.WidgetWidth)          # wrap; no horizontal bar
+        self.output.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)   # scrollbar from the start
         layout.addWidget(self.output, 1)
 
         self.status = QtWidgets.QLabel("", self)
@@ -106,33 +118,36 @@ class AiAssistentGUI(QtWidgets.QWidget):
         row.addWidget(self.interrupt)
         layout.addLayout(row)
 
-    # --- transcript rendering (Markdown) ---
+    # --- transcript rendering (HTML bubbles) ---
+    def _bubble(self, inner):
+        return (f'<table width="100%" cellspacing="0" cellpadding="8" style="margin:3px 0;">'
+                f'<tr><td style="background-color:{_BUBBLE};">{inner}</td></tr></table>')
+
+    def _user_block(self, text):
+        return self._bubble(f'<b>You</b><br>{_htmllib.escape(text)}')
+
+    def _assistant_block(self, active):
+        parts = ['<b>mesoSPIM</b>']
+        for name, args in active["tools"]:
+            parts.append(f'<div style="color:{_DIM};">&#8250; {_htmllib.escape(name)}'
+                         f'({_htmllib.escape(args)})</div>')
+        if active["error"] is not None:
+            parts.append(f'<div style="color:#e08a8a;"><b>&#9888; error</b> — '
+                         f'{_htmllib.escape(active["error"])}</div>')
+        elif active["reply"] is not None:
+            parts.append(_md_to_html(active["reply"]))
+        return self._bubble("".join(parts))
+
+    def _note_block(self, text):
+        return f'<div style="color:{_DIM};margin:3px 0;"><i>{_htmllib.escape(text)}</i></div>'
+
     def _render(self):
-        # A non-breaking-space paragraph between entries renders as a blank line, so messages get
-        # clear breathing room (plain blank lines collapse in Markdown).
-        self.output.setMarkdown("\n\n\u00A0\n\n".join(self._log))
+        blocks = list(self._blocks)
+        if self._active is not None:
+            blocks.append(self._assistant_block(self._active))
+        self.output.setHtml("".join(blocks))
         bar = self.output.verticalScrollBar()
         bar.setValue(bar.maximum())                              # keep the newest line in view
-
-    def _append_user(self, text):
-        self._log.append(f"**You**\n\n{_md_escape(text)}")
-        self._render()
-
-    def _append_assistant(self, text):
-        self._log.append(f"**mesoSPIM**\n\n{text}")             # the model's own Markdown renders
-        self._render()
-
-    def _append_tool(self, name, args):
-        self._log.append(f"`› {name}({args.replace('`', chr(39))})`")
-        self._render()
-
-    def _append_error(self, message):
-        self._log.append(f"**⚠ error** — {_md_escape(' '.join(message.split()))[:600]}")
-        self._render()
-
-    def _append_note(self, message):
-        self._log.append(f"*{_md_escape(message)}*")
-        self._render()
 
     # --- input / turn lifecycle ---
     def on_submit(self):
@@ -140,17 +155,21 @@ class AiAssistentGUI(QtWidgets.QWidget):
         if not text or not self.input.isEnabled():
             return
         if not self._ensure_worker():
-            self._append_note("Stop the Remote Control transport to use the AI Assistant.")
+            self._blocks.append(self._note_block("Stop the Remote Control transport to use the AI Assistant."))
+            self._render()
             return
         self.input.clear()
-        self._append_user(text)
+        self._blocks.append(self._user_block(text))
+        self._active = {"tools": [], "reply": None, "error": None}   # mesoSPIM header appears at once
         self._set_running(True)
+        self._render()
         self.sig_run_turn.emit(text)
 
     def on_interrupt(self):
         if self._worker is not None:
             self._worker.interrupt()
-        self._append_note("[interrupted]")
+        self._blocks.append(self._note_block("[interrupted]"))
+        self._render()
 
     def _set_running(self, running):
         self.input.setEnabled(not running)
@@ -160,16 +179,26 @@ class AiAssistentGUI(QtWidgets.QWidget):
             self.input.setFocus()
 
     def _on_reply(self, text):
-        self._append_assistant(text)
+        if self._active is not None:
+            self._active["reply"] = text
+            self._render()
 
     def _on_tool(self, name, args):
-        self._append_tool(name, args)
+        if self._active is not None:
+            self._active["tools"].append((name, args))
+            self._render()
 
     def _on_error(self, message):
-        self._append_error(message)
+        if self._active is not None:
+            self._active["error"] = message
+            self._render()
 
     def _on_done(self):
+        if self._active is not None:
+            self._blocks.append(self._assistant_block(self._active))
+            self._active = None
         self._set_running(False)
+        self._render()
 
     def shutdown(self):
         """Called by MainWindow on app exit: stop the agent, join with a bound so the GUI
