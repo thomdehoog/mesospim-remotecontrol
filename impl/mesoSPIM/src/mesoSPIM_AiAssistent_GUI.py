@@ -108,7 +108,9 @@ class AiAssistentGUI(QtWidgets.QWidget):
 
     # --- transcript rendering (Markdown) ---
     def _render(self):
-        self.output.setMarkdown("\n\n".join(self._log))
+        # A non-breaking-space paragraph between entries renders as a blank line, so messages get
+        # clear breathing room (plain blank lines collapse in Markdown).
+        self.output.setMarkdown("\n\n\u00A0\n\n".join(self._log))
         bar = self.output.verticalScrollBar()
         bar.setValue(bar.maximum())                              # keep the newest line in view
 
