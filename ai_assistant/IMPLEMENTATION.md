@@ -10,11 +10,10 @@ dispatch; tool exceptions killing the turn. Cut the unreachable "different-op" b
 the two-signal acceptor dance.*
 
 ## Top bench-verify risks (read first)
-1. **Untyped tool args.** Tools take a single `args` object with no per-key schema, so the
-   model must build nested shapes (`{targets:{axis:um}}`) from the hint text. Expect simple
-   commands to work and **nested ones to mis-fire on Gemini Flash**. If they do, switch
-   `build_tools` to `Tool.from_schema(fn, name=, description=, json_schema=...)` with a real
-   per-command schema. Watch `move_absolute`/`move_relative`/`set_*` first.
+1. **Untyped tool args — validated live (2026-07).** Gemini Flash *and* Gemma 4 31B both nested
+   `move_absolute` as `{targets:{x,y}}` correctly from the hint text alone, so the untyped
+   passthrough is good enough — no `Tool.from_schema` needed. If a weaker/local model ever
+   mis-shapes nested args, switch `build_tools` to `Tool.from_schema(...)` with a per-command schema.
 2. **Command core / branch.** This targets `mesoSPIM_RemoteControl_Dispatcher` + `Acceptor`
    (the Remote Control contribution, with `kind`, async WAIT milestones, and `get_progress`
    returning `{"operation": {...}}`). Confirm the repo you integrate into ships that, not a
@@ -36,10 +35,16 @@ Maintainer (2026): Thom de Hoog — thom.dehoog@zmb.uzh.ch / thomdehoog@gmail.co
 
 # The one endpoint. Cloud: PROVIDER="google", set MODEL + KEY_ENV.
 # Local: PROVIDER="openai-compatible", set MODEL + BASE_URL, leave KEY_ENV None.
-PROVIDER = "google"                 # "google" (Gemini) or "openai-compatible"
-MODEL = "gemini-3.5-flash"
+PROVIDER = "google"                 # "google" (Gemini/Gemma) or "openai-compatible"
+MODEL = "gemma-4-31b-it"            # Gemma 4 31B via the Gemini API — generous free tier
+                                    # (30 RPM / 16K TPM / 14.4K RPD), native tool-calling, no 503s.
 KEY_ENV = "GEMINI_API_KEY"
 BASE_URL = None
+
+# Alternatives (uncomment one):
+#   Gemini Flash (cloud):     MODEL = "gemini-3.5-flash"   (or "gemini-flash-latest" — more available)
+#   Gemma 4 31B, local free:  PROVIDER="openai-compatible"; MODEL="gemma4:31b";
+#                             BASE_URL="http://localhost:11434/v1"; KEY_ENV=None  (Ollama >= 0.22, ~20 GB VRAM)
 
 POLL_INTERVAL_S = 0.15
 WAIT_CAP_S = 120                    # past this a WAIT op returns "still_running"; the agent
@@ -76,35 +81,35 @@ _TERMINAL = {COMPLETED, FAILED}
 
 
 def dispatch_and_wait(acceptor, name, args, kind, cancel, cfg=config):
-    """Run one command and return a *finished* result.
+    """Run one command and return a finished result. For WAIT commands the return always
+    carries a consistent top-level `status` ('completed' / 'failed' / 'still_running' /
+    'cancelled'); READ/ACTION commands pass their own result through unchanged.
 
-    A WAIT command (move, mode change, acquisition) returns 'processing' immediately and
-    completes later on a milestone signal. Rather than teach the LLM to poll, we poll here:
-    one tool call == one completed action, needing no rule in the prompt. Past WAIT_CAP_S the
-    op is treated as long-running — return 'still_running' so the worker frees up and the
-    agent can poll get_progress (an unbounded wait would hang on a never-signalled op; see
-    clear_stuck_operation).
-
-    Status/id live under the "operation" key of both the accept-reply and get_progress.
+    A WAIT command returns 'processing' immediately and completes later on a milestone; we
+    poll get_progress here so one tool call == one completed action (no polling rule in the
+    prompt). Past WAIT_CAP_S it returns 'still_running' so the worker frees up (an unbounded
+    wait would hang on a never-signalled op — see clear_stuck_operation). Status/id live under
+    the "operation" key of both the accept-reply and get_progress.
     """
     if cancel.is_set():
-        return {"cancelled": True}                                  # gate every call after Interrupt
+        return {"status": "cancelled"}                              # gate every call after Interrupt
     result = acceptor.dispatch(name, args or {})
     if kind != WAIT:
         return result
     op = (result or {}).get("operation") or {}
-    if op.get("status") in _TERMINAL:
-        return result
     op_id = op.get("id")
+    if op.get("status") in _TERMINAL:
+        return {"status": op["status"], "operation": op_id, "result": result}
 
     deadline = time.monotonic() + cfg.WAIT_CAP_S
     while time.monotonic() < deadline:
         if cancel.is_set():
-            return {"cancelled": True, "operation": op_id}          # interrupt() halts the hardware
+            return {"status": "cancelled", "operation": op_id}      # interrupt() halts the hardware
         time.sleep(cfg.POLL_INTERVAL_S)
         snap = acceptor.dispatch("get_progress", {}) or {}          # READ: cheap, holds no gate
-        if (snap.get("operation") or {}).get("status") in _TERMINAL:
-            return snap
+        status = (snap.get("operation") or {}).get("status")
+        if status in _TERMINAL:
+            return {"status": status, "operation": op_id, "result": snap}
     return {"status": "still_running", "operation": op_id,
             "note": "operation exceeds the wait cap; call get_progress to check on it."}
 
@@ -192,7 +197,7 @@ class AssistantWorker(QtCore.QObject):
             self.cancel.clear()
             if self._agent is None:
                 self._agent = build_agent(self._acceptor, self.cancel)
-            result = self._agent.run_sync(text, message_history=self._history)
+            result = self._run_with_retry(text)
             self._surface_tools(result.new_messages())
             self._history = result.all_messages()
             self.sig_reply.emit(result.output)
@@ -200,6 +205,19 @@ class AssistantWorker(QtCore.QObject):
             self.sig_error.emit(str(error))
         finally:
             self.sig_done.emit()
+
+    def _run_with_retry(self, text, tries=3):
+        """Free-tier Flash models intermittently 503 (UNAVAILABLE) / 429 under load; retry
+        those with a short backoff before surfacing an error."""
+        for attempt in range(tries):
+            try:
+                return self._agent.run_sync(text, message_history=self._history)
+            except Exception as error:
+                transient = any(s in str(error) for s in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
+                if attempt < tries - 1 and transient:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                raise
 
     def _surface_tools(self, messages):
         """Emit each tool call the agent made this turn, in order (a ToolCallPart carries
@@ -363,8 +381,9 @@ command reference below. You act on behalf of a trained operator working at the 
 Conventions
 - Positions and distances are micrometres (µm) unless a command says otherwise.
 - Axes are x, y, z (stage) and f (focus); the reference frame is the microscope stage frame.
-- A tool call returns only once the action has actually completed. Long acquisitions may
-  return "still_running" — call get_progress to check on those.
+- A tool call already waits for the action to finish before returning — do NOT call
+  get_progress yourself. Only if a result says "still_running" (a long acquisition) should
+  you poll get_progress.
 - Each command's description gives the exact argument shape — follow it literally, including
   nesting (e.g. move_absolute takes {"targets": {"x": <um>}}).
 
@@ -428,7 +447,7 @@ def test_read_returns_immediately():
 def test_wait_blocks_until_completed():
     acc = FakeAcceptor(flip_after=3)
     out = dispatch_and_wait(acc, "move_absolute", {"targets": {"x": 12000}}, WAIT, threading.Event(), _Cfg)
-    assert out["operation"]["status"] == COMPLETED
+    assert out["status"] == COMPLETED
     assert [c[0] for c in acc.calls].count("get_progress") == 3
 
 
@@ -437,12 +456,12 @@ def test_cancel_before_dispatch_actuates_nothing():
     cancel = threading.Event()
     cancel.set()
     out = dispatch_and_wait(acc, "move_absolute", {"targets": {"x": 1}}, WAIT, cancel, _Cfg)
-    assert out["cancelled"] is True
+    assert out["status"] == "cancelled"
     assert acc.calls == []                                         # gated before any dispatch
 
 
 def test_wait_returns_still_running_past_cap():
-    acc = FakeAcceptor(flip_after=999)                            # never completes
+    acc = FakeAcceptor(flip_after=10**9)                          # genuinely never completes
 
     class Cfg:
         POLL_INTERVAL_S = 0.0
