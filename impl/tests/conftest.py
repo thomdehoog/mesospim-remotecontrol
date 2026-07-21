@@ -230,6 +230,18 @@ def _install_fake_pyqt5():
         def verticalScrollBar(self):
             return self._bar
 
+        def textCursor(self):
+            class _Cursor:
+                def movePosition(self, _pos):
+                    pass
+            return _Cursor()
+
+        def setTextCursor(self, _cursor):
+            pass
+
+        def ensureCursorVisible(self):
+            pass
+
     class QLabel(QWidget):
         def __init__(self, *_args, **_kwargs):
             super().__init__()
@@ -306,7 +318,11 @@ def _install_fake_pyqt5():
         def toHtml(self):
             return "<body>" + getattr(self, "_markdown", "") + "</body>"
 
+    class QTextCursor:
+        End = 0
+
     qtgui.QTextDocument = QTextDocument
+    qtgui.QTextCursor = QTextCursor
 
     pyqt5 = types.ModuleType("PyQt5")
     pyqt5.QtCore = qtcore

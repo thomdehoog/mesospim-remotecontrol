@@ -146,8 +146,10 @@ class AiAssistentGUI(QtWidgets.QWidget):
         if self._active is not None:
             blocks.append(self._assistant_block(self._active))
         self.output.setHtml("".join(blocks))
-        bar = self.output.verticalScrollBar()
-        bar.setValue(bar.maximum())                              # keep the newest line in view
+        cursor = self.output.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.End)               # collapse to the end: nothing selected
+        self.output.setTextCursor(cursor)
+        self.output.ensureCursorVisible()                        # scroll to the newest line
 
     # --- input / turn lifecycle ---
     def on_submit(self):
