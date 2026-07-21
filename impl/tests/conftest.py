@@ -73,12 +73,20 @@ def _install_fake_pyqt5():
     class _Qt:
         QueuedConnection = 0
         DirectConnection = 1
+        BlockingQueuedConnection = 3
+
+    class QMetaObject:
+        @staticmethod
+        def invokeMethod(obj, member, _conn=0):
+            # In-test every QObject shares _MAIN_THREAD, so a cross-thread invoke is just a call.
+            getattr(obj, member)()
 
     qtcore.QObject = QObject
     qtcore.pyqtSignal = pyqtSignal
     qtcore.pyqtSlot = pyqtSlot
     qtcore.QThread = QThread
     qtcore.QTimer = QTimer
+    qtcore.QMetaObject = QMetaObject
     qtcore.Qt = _Qt
 
     qtnetwork = types.ModuleType("PyQt5.QtNetwork")
@@ -134,9 +142,14 @@ def _install_fake_pyqt5():
         Password = 2                                     # matches QtWidgets.QLineEdit.Password
 
         def __init__(self, text="", parent=None):
+            # Real PyQt5 overloads QLineEdit(parent) and QLineEdit(str, parent); mirror that so a
+            # widget passed as the first argument is treated as the parent, not the initial text.
+            if not isinstance(text, str):
+                text, parent = "", text
             super().__init__(parent)
             self._text = text
             self._echo = QLineEdit.Normal
+            self.returnPressed = _Signal()
 
         def text(self):
             return self._text
@@ -144,11 +157,36 @@ def _install_fake_pyqt5():
         def setText(self, text):
             self._text = text
 
+        def clear(self):
+            self._text = ""
+
+        def setPlaceholderText(self, _text):
+            pass
+
+        def setFocus(self):
+            pass
+
         def setEchoMode(self, mode):
             self._echo = mode
 
         def echoMode(self):
             return self._echo
+
+    class QPlainTextEdit(QWidget):
+        """The AI Assistant transcript: records appended lines so a test can read them back."""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self._lines = []
+
+        def setReadOnly(self, _flag):
+            pass
+
+        def appendPlainText(self, text):
+            self._lines.append(text)
+
+        def toPlainText(self):
+            return "\n".join(self._lines)
 
     class QLabel(QWidget):
         def __init__(self, *_args, **_kwargs):
@@ -174,6 +212,9 @@ def _install_fake_pyqt5():
             pass
 
         def addRow(self, *_a, **_k):
+            pass
+
+        def addLayout(self, *_a, **_k):
             pass
 
         def addStretch(self, *_a, **_k):
@@ -206,7 +247,8 @@ def _install_fake_pyqt5():
             QMessageBox.warnings.append((parent, title, message))
 
     for _name, _obj in (("QWidget", QWidget), ("QComboBox", QComboBox), ("QLineEdit", QLineEdit),
-                        ("QLabel", QLabel), ("QPushButton", QPushButton),
+                        ("QPlainTextEdit", QPlainTextEdit), ("QLabel", QLabel),
+                        ("QPushButton", QPushButton),
                         ("QVBoxLayout", QVBoxLayout), ("QFormLayout", QFormLayout),
                         ("QHBoxLayout", QHBoxLayout), ("QGroupBox", QGroupBox),
                         ("QMessageBox", QMessageBox)):

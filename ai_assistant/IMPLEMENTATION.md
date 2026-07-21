@@ -1,5 +1,16 @@
 # AI Assistant — full implementation (single-file handoff)
 
+> **LANDED (2026-07).** This handoff has been split into real modules under `impl/mesoSPIM/src/`
+> (`mesoSPIM_AiAssistent_Config.py`, `mesoSPIM_AiAssistent.py`, `mesoSPIM_AiAssistent_GUI.py`,
+> `assistant_manual.md`), with Qt-free tests in `impl/tests/test_ai_assistent.py` and
+> `impl/tests/test_ai_assistent_gui.py` (all green — 352 in the suite), and the Core/MainWindow
+> wiring documented in **`impl/INTEGRATION_AI_ASSISTANT.md`**. Those files are authoritative; the
+> blocks below are the design snapshot. The integration section here was corrected to the landed
+> wiring: verified against the real dispatcher (`get_progress`/WAIT nest the op under `operation` —
+> the poll is right), and the earlier `build_assistant_acceptor` sketch was replaced by
+> `start_assistant_for_core`/`stop_assistant_for_core` in the Servers module + tiny
+> `start_ai_assistant`/`stop_ai_assistant` Core delegates, mirroring `start_for_core`.
+
 Complete implementation for `mesoSPIM_AiAssistent_*` (see `AI_Assistant_minimal_design.md`).
 Split each fenced block into its named file to land it.
 
@@ -481,52 +492,64 @@ def test_build_tools_covers_every_command():
 
 ---
 
-## Integration (existing files)
+## Integration (existing files) — see `impl/INTEGRATION_AI_ASSISTANT.md` for the full doc
 
-### `mesoSPIM_MainWindow.py`  — three lines, mirroring RemoteControlGUI
+The Assistant is **purely additive**: the five `mesoSPIM_RemoteControl_*` modules stay byte-identical
+to their shipped patch (CI enforces this), so the Acceptor lifecycle lives in the new
+`mesoSPIM_AiAssistent.py`, and Core keeps only tiny delegate slots.
+
+### `mesoSPIM_AiAssistent.py` — the assistant lifecycle (landed; reuses the RC Acceptor + self_test)
+
+```python
+def start_assistant_for_core(core):
+    """Build the in-process Acceptor on the Core thread; store it on core._assistant_acceptor.
+    Fail-closed (same self-test as a transport). Refuses while a transport runs; returns the
+    acceptor, or None on refusal / self-test failure."""
+    if getattr(core, "_remote_control", None) is not None:
+        core._assistant_acceptor = None
+        return None
+    if getattr(core, "_assistant_acceptor", None) is None:
+        ok, report = self_test(core)
+        if not ok:
+            logger.error("AI Assistant self-test failed: %s", "; ".join(report))
+            core._assistant_acceptor = None
+            return None
+        core._assistant_acceptor = Acceptor(core)
+    return core._assistant_acceptor
+
+def stop_assistant_for_core(core):
+    acceptor = getattr(core, "_assistant_acceptor", None)
+    if acceptor is not None:
+        acceptor.stop()
+        core._assistant_acceptor = None
+```
+
+Exclusion is one-way (the Assistant refuses while a transport runs); the reverse guardrail would need
+a 3-line edit to the frozen `start_for_core`, and is deferred because two Acceptors complete
+idempotently through the one gate — see `INTEGRATION_AI_ASSISTANT.md` §2.
+
+### `mesoSPIM_Core.py` — one attribute + two delegate slots
+
+```python
+self._assistant_acceptor = None                # in __init__, beside self._remote_control = None
+
+@QtCore.pyqtSlot()
+def start_ai_assistant(self):
+    from .mesoSPIM_AiAssistent import start_assistant_for_core
+    start_assistant_for_core(self)
+
+@QtCore.pyqtSlot()
+def stop_ai_assistant(self):
+    from .mesoSPIM_AiAssistent import stop_assistant_for_core
+    stop_assistant_for_core(self)
+```
+
+### `mesoSPIM_MainWindow.py` — three lines, mirroring RemoteControlGUI
 
 ```python
 from .mesoSPIM_AiAssistent_GUI import AiAssistentGUI              # near the other tab imports
-
-# in __init__, AFTER self.remote_control = RemoteControlGUI(self):
-self.ai_assistent = AiAssistentGUI(self)
-
-# in the close handler, next to self.remote_control.shutdown():
-self.ai_assistent.shutdown()
-```
-
-### `mesoSPIM_Core.py`  — build/tear down the assistant Acceptor on the Core thread
-
-```python
-from PyQt5 import QtCore
-from .mesoSPIM_RemoteControl_Servers import Acceptor
-
-@QtCore.pyqtSlot()
-def build_assistant_acceptor(self):
-    """Build the assistant's Acceptor on the Core thread (affinity comes from here). Refuses
-    if a TCP/MCP transport is active — assistant and transport are mutually exclusive (one
-    Acceptor, wired once). Leaves _assistant_acceptor None on refusal so the tab can say so."""
-    if getattr(self, "_remote_control", None) is not None:
-        self._assistant_acceptor = None
-        return
-    if getattr(self, "_assistant_acceptor", None) is None:
-        self._assistant_acceptor = Acceptor(self)                # __init__ wires completion signals once
-
-@QtCore.pyqtSlot()
-def teardown_assistant_acceptor(self):
-    acc = getattr(self, "_assistant_acceptor", None)
-    if acc is not None:
-        acc.stop()                                               # unwire completion signals
-        self._assistant_acceptor = None
-```
-
-### `mesoSPIM_RemoteControl_Servers.py`  — the reverse mutual-exclusion, in `start_for_core`
-
-```python
-# at the top of start_for_core(core, mode, host, port, token), before start():
-if getattr(core, "_assistant_acceptor", None) is not None:
-    core.sig_remote_control_started.emit(False, "AI Assistant is active — close it before starting a transport")
-    return
+self.ai_assistent = AiAssistentGUI(self)                         # after self.remote_control = RemoteControlGUI(self)
+self.ai_assistent.shutdown()                                     # in close_app, beside self.remote_control.shutdown()
 ```
 
 ---
