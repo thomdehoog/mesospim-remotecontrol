@@ -65,12 +65,18 @@ def dispatch_and_wait(acceptor, name, args, kind, cancel, cfg=config):
             "note": "operation exceeds the wait cap; call get_progress to check on it."}
 
 
-def _tool_fn(acceptor, name, kind, cancel):
+def _tool_fn(acceptor, name, kind, cancel, on_call=None):
     """One passthrough tool body, closing over the command it dispatches. Pydantic AI builds
-    the tool's schema from this signature — a single optional `args` object. Dispatch errors
-    (out-of-range, busy) are returned to the model as data so it can self-correct, not raised."""
+    the tool's schema from this signature — a single optional `args` object. `on_call` (if given)
+    is invoked the moment the command fires, so the GUI can stream the activity live. Dispatch
+    errors (out-of-range, busy) are returned to the model as data so it can self-correct, not raised."""
     def _call(args: dict | None = None) -> str:
         """See the tool description (the command's hint)."""
+        if on_call is not None:
+            try:
+                on_call(name, json.dumps(args or {}))
+            except Exception:
+                pass
         try:
             return json.dumps(dispatch_and_wait(acceptor, name, args, kind, cancel))
         except Exception as error:
@@ -79,14 +85,14 @@ def _tool_fn(acceptor, name, kind, cancel):
     return _call
 
 
-def build_tools(acceptor, cancel):
+def build_tools(acceptor, cancel, on_call=None):
     """One untyped passthrough tool per command. The tool list IS COMMANDS — never
     hand-maintained. Per-arg correctness comes from each command's accept() validator.
     NOTE (bench risk #1): untyped args → nested commands may mis-fire; Tool.from_schema is
     the upgrade if so."""
     from pydantic_ai import Tool
     return [
-        Tool(_tool_fn(acceptor, name, cmd.kind, cancel),
+        Tool(_tool_fn(acceptor, name, cmd.kind, cancel, on_call),
              takes_ctx=False, name=name, description=cmd.hint or name)
         for name, cmd in COMMANDS.items()
     ]
@@ -102,25 +108,36 @@ def build_system_prompt(acceptor):
     return preamble + "\n\n# Microscope command reference\n\n" + manual_text
 
 
-def build_model():
-    """Construct the Pydantic AI model from the flat config. Cloud Gemini is native; anything
-    OpenAI-compatible (openai / openrouter / ollama / vllm / …) goes through the OpenAI
-    provider with a base_url."""
+def _build_one(model_id):
+    """One model from the flat config. Cloud Gemini is native; anything OpenAI-compatible
+    (openai / openrouter / ollama / vllm / …) goes through the OpenAI provider with a base_url."""
     key = os.environ.get(config.KEY_ENV) if config.KEY_ENV else None
     if config.PROVIDER == "google":
         from pydantic_ai.models.google import GoogleModel
         from pydantic_ai.providers.google import GoogleProvider
-        return GoogleModel(config.MODEL, provider=GoogleProvider(api_key=key))
+        return GoogleModel(model_id, provider=GoogleProvider(api_key=key))
     from pydantic_ai.models.openai import OpenAIChatModel
     from pydantic_ai.providers.openai import OpenAIProvider
-    return OpenAIChatModel(config.MODEL, provider=OpenAIProvider(base_url=config.BASE_URL, api_key=key or "not-needed"))
+    return OpenAIChatModel(model_id, provider=OpenAIProvider(base_url=config.BASE_URL, api_key=key or "not-needed"))
 
 
-def build_agent(acceptor, cancel):
+def build_model():
+    """The primary model, wrapped with the fallback so a rate-limited or unavailable primary rolls
+    over transparently — each Gemini model carries its own quota. FALLBACK_MODEL=None disables it."""
+    primary = _build_one(config.MODEL)
+    fallback = getattr(config, "FALLBACK_MODEL", None)
+    if not fallback:
+        return primary
+    from pydantic_ai.models.fallback import FallbackModel
+    return FallbackModel(primary, _build_one(fallback))
+
+
+def build_agent(acceptor, cancel, on_call=None):
     from pydantic_ai import Agent
     # instructions (not system_prompt): applied fresh each run, not accumulated into the
     # message history we carry across turns.
-    return Agent(build_model(), instructions=build_system_prompt(acceptor), tools=build_tools(acceptor, cancel))
+    return Agent(build_model(), instructions=build_system_prompt(acceptor),
+                 tools=build_tools(acceptor, cancel, on_call))
 
 
 # --- In-process Acceptor lifecycle (called by Core's start_ai_assistant / stop_ai_assistant slots) ---
@@ -179,15 +196,19 @@ class AssistantWorker(QtCore.QObject):
         try:
             self.cancel.clear()
             if self._agent is None:
-                self._agent = build_agent(self._acceptor, self.cancel)
+                self._agent = build_agent(self._acceptor, self.cancel, on_call=self._emit_tool)
             result = self._run_with_retry(text)
-            self._surface_tools(result.new_messages())
             self._history = result.all_messages()
             self.sig_reply.emit(result.output)
         except Exception as error:
             self.sig_error.emit(str(error))
         finally:
             self.sig_done.emit()
+
+    def _emit_tool(self, name, args):
+        """Called at the tool boundary (worker thread) as each command fires; the queued signal
+        delivers it to the GUI so tool calls stream in live rather than all at the end of the turn."""
+        self.sig_tool.emit(name, args)
 
     def _run_with_retry(self, text, tries=3):
         """Free-tier Flash models intermittently 503 (UNAVAILABLE) / 429 under load; retry
@@ -201,17 +222,6 @@ class AssistantWorker(QtCore.QObject):
                     time.sleep(2 * (attempt + 1))
                     continue
                 raise
-
-    def _surface_tools(self, messages):
-        """Emit each tool call the agent made this turn, in order (a ToolCallPart carries
-        tool_name + args)."""
-        for message in messages:
-            for part in getattr(message, "parts", []):
-                if getattr(part, "part_kind", "") == "tool-call":
-                    name = getattr(part, "tool_name", "?")
-                    to_json = getattr(part, "args_as_json_str", None)
-                    args = to_json() if callable(to_json) else json.dumps(getattr(part, "args", ""))
-                    self.sig_tool.emit(name, args)
 
     def interrupt(self):
         """Stop a runaway turn: gate further dispatches (dispatch_and_wait checks cancel) and

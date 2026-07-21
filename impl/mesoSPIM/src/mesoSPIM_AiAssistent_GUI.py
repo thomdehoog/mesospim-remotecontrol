@@ -1,7 +1,9 @@
-"""The 'AI Assistant' tab: an output transcript and an input line. Enter submits; the input
-disables while a turn runs (single-flight). Interrupt halts a runaway agent. The Acceptor is
-acquired lazily on first use — until then the Remote Control transports stay usable, and the
-two are mutually exclusive (one controller drives the instrument at a time).
+"""The 'AI Assistant' tab: a chat transcript and an input line, styled like a coding-agent chat.
+
+The transcript renders Markdown (the model's bold/lists come through), streams each tool call as it
+fires, and shows a 'working' status while a turn runs. Enter submits; the input disables during a
+turn (single-flight); Interrupt halts a runaway agent. The Acceptor is acquired lazily on first use
+— until then the Remote Control transports stay usable, and the two are mutually exclusive.
 
 Maintainer (2026):
     Thom de Hoog
@@ -15,6 +17,14 @@ from PyQt5 import QtCore, QtWidgets
 from .mesoSPIM_AiAssistent import AssistantWorker
 
 
+def _md_escape(text):
+    """Escape Markdown-active characters so literal text (a user line, an error) is shown verbatim
+    instead of being reinterpreted as formatting."""
+    for ch in "\\`*_{}[]()#+-.!":
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
 class AiAssistentGUI(QtWidgets.QWidget):
     sig_run_turn = QtCore.pyqtSignal(str)
 
@@ -24,6 +34,7 @@ class AiAssistentGUI(QtWidgets.QWidget):
         self.core = parent.core
         self.setObjectName("AiAssistentTabWidget")
         self._worker = None
+        self._log = []                                            # markdown blocks, oldest first
         self._build_ui()
         index = parent.TabWidget.indexOf(parent.remote_control)   # RemoteControlGUI instance
         if index >= 0:
@@ -54,8 +65,8 @@ class AiAssistentGUI(QtWidgets.QWidget):
         self._worker = AssistantWorker(acceptor)
         self._worker.moveToThread(self._thread)
         self.sig_run_turn.connect(self._worker.run_turn, QtCore.Qt.QueuedConnection)
-        self._worker.sig_reply.connect(self._append_ai)
-        self._worker.sig_tool.connect(self._append_tool)
+        self._worker.sig_reply.connect(self._on_reply)
+        self._worker.sig_tool.connect(self._on_tool)
         self._worker.sig_error.connect(self._on_error)
         self._worker.sig_done.connect(self._on_done)
         self._thread.start()
@@ -66,57 +77,94 @@ class AiAssistentGUI(QtWidgets.QWidget):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
-        self.output = QtWidgets.QPlainTextEdit(self)
+        font = self.font()
+        font.setPointSize(12)                                     # match Remote Control
+
+        self.output = QtWidgets.QTextEdit(self)
         self.output.setReadOnly(True)
         self.output.setObjectName("AiAssistentOutput")
+        self.output.setFont(font)
+        self.output.setLineWrapMode(QtWidgets.QTextEdit.WidgetWidth)   # wrap; no horizontal scrollbar
         layout.addWidget(self.output, 1)
+
+        self.status = QtWidgets.QLabel("", self)
+        self.status.setObjectName("AiAssistentStatus")
+        self.status.setFont(font)
+        layout.addWidget(self.status)
 
         row = QtWidgets.QHBoxLayout()
         self.input = QtWidgets.QLineEdit(self)
         self.input.setPlaceholderText("Ask the microscope…")
         self.input.setObjectName("AiAssistentInput")
+        self.input.setFont(font)
         self.input.returnPressed.connect(self.on_submit)
         self.interrupt = QtWidgets.QPushButton("Interrupt", self)
+        self.interrupt.setFont(font)
         self.interrupt.setEnabled(False)
         self.interrupt.clicked.connect(self.on_interrupt)
         row.addWidget(self.input, 1)
         row.addWidget(self.interrupt)
         layout.addLayout(row)
 
+    # --- transcript rendering (Markdown) ---
+    def _render(self):
+        self.output.setMarkdown("\n\n".join(self._log))
+        bar = self.output.verticalScrollBar()
+        bar.setValue(bar.maximum())                              # keep the newest line in view
+
+    def _append_user(self, text):
+        self._log.append(f"**You**\n\n{_md_escape(text)}")
+        self._render()
+
+    def _append_assistant(self, text):
+        self._log.append(f"**mesoSPIM**\n\n{text}")             # the model's own Markdown renders
+        self._render()
+
+    def _append_tool(self, name, args):
+        self._log.append(f"`› {name}({args.replace('`', chr(39))})`")
+        self._render()
+
+    def _append_error(self, message):
+        self._log.append(f"**⚠ error** — {_md_escape(' '.join(message.split()))[:600]}")
+        self._render()
+
+    def _append_note(self, message):
+        self._log.append(f"*{_md_escape(message)}*")
+        self._render()
+
+    # --- input / turn lifecycle ---
     def on_submit(self):
         text = self.input.text().strip()
         if not text or not self.input.isEnabled():
             return
         if not self._ensure_worker():
-            self._append("—", "Stop the Remote Control transport to use the AI Assistant.")
+            self._append_note("Stop the Remote Control transport to use the AI Assistant.")
             return
         self.input.clear()
-        self._append("You", text)
+        self._append_user(text)
         self._set_running(True)
         self.sig_run_turn.emit(text)
 
     def on_interrupt(self):
         if self._worker is not None:
             self._worker.interrupt()
-        self._append("—", "[interrupted]")
+        self._append_note("[interrupted]")
 
     def _set_running(self, running):
         self.input.setEnabled(not running)
         self.interrupt.setEnabled(running)
+        self.status.setText("mesoSPIM is working…" if running else "")
         if not running:
             self.input.setFocus()
 
-    def _append(self, who, text):
-        self.output.appendPlainText(f"{who}:  {text}")
+    def _on_reply(self, text):
+        self._append_assistant(text)
 
-    def _append_ai(self, text):
-        self._append("AI", text)
-
-    def _append_tool(self, name, args):
-        self._append("·", f"{name}({args})")
+    def _on_tool(self, name, args):
+        self._append_tool(name, args)
 
     def _on_error(self, message):
-        self._append("error", message)
+        self._append_error(message)
 
     def _on_done(self):
         self._set_running(False)

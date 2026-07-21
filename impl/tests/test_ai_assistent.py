@@ -84,28 +84,9 @@ def test_build_tools_covers_every_command():
 
 # --- the worker: turn, retry, tool-surfacing, interrupt (fake agent) ---
 
-class _Part:
-    def __init__(self, name, args):
-        self.part_kind = "tool-call"
-        self.tool_name = name
-        self._a = args
-
-    def args_as_json_str(self):
-        return json.dumps(self._a)
-
-
-class _Msg:
-    def __init__(self, parts):
-        self.parts = parts
-
-
 class FakeResult:
-    def __init__(self, output, tool_calls=()):
+    def __init__(self, output):
         self.output = output
-        self._tools = tool_calls
-
-    def new_messages(self):
-        return [_Msg([_Part(n, a) for n, a in self._tools])]
 
     def all_messages(self):
         return ["history"]
@@ -132,20 +113,29 @@ def _collect(signal):
     return got
 
 
-def test_run_turn_emits_reply_and_surfaces_tools(monkeypatch):
+def test_run_turn_emits_reply(monkeypatch):
     worker = AssistantWorker(FakeAcceptor())
-    monkeypatch.setattr(ai, "build_agent",
-                        lambda a, c: FakeAgent([FakeResult("moved", [("move_absolute", {"targets": {"x": 1}})])]))
+    monkeypatch.setattr(ai, "build_agent", lambda a, c, on_call=None: FakeAgent([FakeResult("moved")]))
     replies = _collect(worker.sig_reply)
-    tools = _collect(worker.sig_tool)
+    dones = _collect(worker.sig_done)
     worker.run_turn("go")
     assert replies == ["moved"]
-    assert tools == [("move_absolute", json.dumps({"targets": {"x": 1}}))]
+    assert len(dones) == 1
+
+
+def test_tool_fn_streams_call_before_dispatch():
+    acc = FakeAcceptor()
+    seen = []
+    tool = ai._tool_fn(acc, "get_state", READ, threading.Event(), on_call=lambda n, a: seen.append((n, a)))
+    out = tool({"foo": 1})
+    assert seen == [("get_state", json.dumps({"foo": 1}))]      # surfaced live, at the tool boundary
+    assert ("get_state", {"foo": 1}) in acc.calls               # then dispatched
+    assert "accepted" in out
 
 
 def test_run_turn_error_emits_sig_error(monkeypatch):
     worker = AssistantWorker(FakeAcceptor())
-    monkeypatch.setattr(ai, "build_agent", lambda a, c: FakeAgent(errors=[RuntimeError("boom")]))
+    monkeypatch.setattr(ai, "build_agent", lambda a, c, on_call=None: FakeAgent(errors=[RuntimeError("boom")]))
     errors = _collect(worker.sig_error)
     dones = _collect(worker.sig_done)
     worker.run_turn("go")

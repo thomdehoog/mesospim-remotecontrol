@@ -188,6 +188,41 @@ def _install_fake_pyqt5():
         def toPlainText(self):
             return "\n".join(self._lines)
 
+    class _ScrollBar:
+        def setValue(self, _value):
+            pass
+
+        def maximum(self):
+            return 0
+
+    class QTextEdit(QWidget):
+        """The AI Assistant transcript (rich). Records the last rendered Markdown for assertions."""
+
+        WidgetWidth = 0
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self._markdown = ""
+            self._bar = _ScrollBar()
+
+        def setReadOnly(self, _flag):
+            pass
+
+        def setLineWrapMode(self, _mode):
+            pass
+
+        def setMarkdown(self, text):
+            self._markdown = text
+
+        def toMarkdown(self):
+            return self._markdown
+
+        def toPlainText(self):
+            return self._markdown
+
+        def verticalScrollBar(self):
+            return self._bar
+
     class QLabel(QWidget):
         def __init__(self, *_args, **_kwargs):
             super().__init__()
@@ -247,7 +282,7 @@ def _install_fake_pyqt5():
             QMessageBox.warnings.append((parent, title, message))
 
     for _name, _obj in (("QWidget", QWidget), ("QComboBox", QComboBox), ("QLineEdit", QLineEdit),
-                        ("QPlainTextEdit", QPlainTextEdit), ("QLabel", QLabel),
+                        ("QPlainTextEdit", QPlainTextEdit), ("QTextEdit", QTextEdit), ("QLabel", QLabel),
                         ("QPushButton", QPushButton),
                         ("QVBoxLayout", QVBoxLayout), ("QFormLayout", QFormLayout),
                         ("QHBoxLayout", QHBoxLayout), ("QGroupBox", QGroupBox),
