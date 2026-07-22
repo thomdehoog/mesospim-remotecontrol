@@ -106,26 +106,41 @@ def smoke():
     print("smoke: OK")
 
 
-def score(selected, budget, rpm):
-    """Run each case on a fresh backend and collect the report rows."""
+def score(selected, budget, rpm, repeat=1):
+    """Run each case on a fresh backend and collect the report rows.
+
+    A case is only as good as its worst trial, so `repeat` runs it several times and passes it
+    only if every trial passed. One trial cannot tell a real improvement from run-to-run variance:
+    the same prompt has produced both one and two calls to the same command across runs, so a
+    single-trial delta of one tool call means nothing on its own."""
     pacer, rows, spent = Pacer(rpm), [], 0
     for case in selected:
-        if budget and spent >= budget:
+        trials = []
+        for _ in range(repeat):
+            if budget and spent >= budget:
+                break
+            acceptor, core = fake_backend()
+            pacer.wait_for(case.get("max_tools", 3))
+            turn = run_turn(acceptor, case["prompt"])
+            spent += turn.requests
+            failures = check(case, turn, core)
+            trials.append({"passed": not failures, "failures": failures, "tools": turn.tools,
+                           "core_calls": [name for name, _, _ in core.calls], "reply": turn.reply,
+                           "error": turn.error, "seconds": turn.seconds, "requests": turn.requests})
+        if not trials:
             print(f"-- budget of {budget} requests reached, stopping --")
             break
-        acceptor, core = fake_backend()
-        pacer.wait_for(case.get("max_tools", 3))
-        turn = run_turn(acceptor, case["prompt"])
-        spent += turn.requests
-        failures = check(case, turn, core)
+        passes = sum(t["passed"] for t in trials)
         rows.append({"id": case["id"], "category": case["category"], "prompt": case["prompt"],
-                     "passed": not failures, "failures": failures,
-                     "tools": turn.tools, "core_calls": [name for name, _, _ in core.calls],
-                     "reply": turn.reply, "error": turn.error,
-                     "seconds": turn.seconds, "requests": turn.requests})
-        mark = "PASS" if not failures else "FAIL"
-        print(f"[{mark}] {case['id']:<26} {turn.tool_names or '(no tools)'}")
-        for line in failures:
+                     "passed": passes == len(trials), "pass_count": passes,
+                     "trial_count": len(trials), "trials": trials,
+                     "failures": sorted({line for t in trials for line in t["failures"]})})
+        mark = "PASS" if passes == len(trials) else "FAIL"
+        tally = f" {passes}/{len(trials)}" if len(trials) > 1 else ""
+        calls = " | ".join(str(t["tools"] and [n for n, _ in t["tools"]] or "(no tools)")
+                           for t in trials)
+        print(f"[{mark}]{tally} {case['id']:<26} {calls}")
+        for line in rows[-1]["failures"]:
             print(f"       - {line}")
     return rows, spent
 
@@ -137,6 +152,7 @@ def main():
     parser.add_argument("--only", default="", help="comma-separated case ids")
     parser.add_argument("--budget", type=int, default=0, help="stop after N model requests")
     parser.add_argument("--rpm", type=int, default=12, help="requests per minute ceiling")
+    parser.add_argument("--repeat", type=int, default=1, help="trials per case; a case must pass all")
     args = parser.parse_args()
 
     if args.smoke or not args.live:
@@ -150,7 +166,7 @@ def main():
     wanted = {name for name in args.only.split(",") if name}
     selected = [c for c in suite.CASES if not wanted or c["id"] in wanted]
     started = time.time()
-    rows, spent = score(selected, args.budget, args.rpm)
+    rows, spent = score(selected, args.budget, args.rpm, args.repeat)
 
     passed = sum(row["passed"] for row in rows)
     by_category = Counter(row["category"] for row in rows if not row["passed"])
