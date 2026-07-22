@@ -34,6 +34,9 @@ _TERMINAL = {COMPLETED, FAILED}
 # what the model already has). get_manual is the whole command reference — large and static.
 _PROMPT_ONLY = {"get_manual"}
 
+# Each command's args go on the wire as-is; the hint documents the shape and accept() enforces it.
+_ARGS_SCHEMA = {"type": "object", "additionalProperties": True}
+
 
 def dispatch_and_wait(acceptor, name, args, kind, cancel, cfg=config):
     """Run one command and return a finished result. For WAIT commands the return always
@@ -69,12 +72,29 @@ def dispatch_and_wait(acceptor, name, args, kind, cancel, cfg=config):
             "note": "operation exceeds the wait cap; call get_progress to check on it."}
 
 
+def _configured_options(acceptor):
+    """The instrument's own vocabulary, fetched only after a call was refused on its values.
+
+    A rejection is the model's whole basis for self-correcting, and the validators are not uniform
+    about it: set_filter answers "not one of ['Empty', '515LP']" and the agent recovers, while
+    set_zoom answers "'zoom' must be a string" — a type check that fires before the membership
+    check — and the agent dead-ends into asking the operator for a vocabulary the microscope
+    already knows. Attaching get_config (a READ; it holds no gate) makes every refusal as
+    instructive as the best one, without touching the shipped validators."""
+    try:
+        reply = acceptor.dispatch("get_config", {})
+    except Exception:
+        return None
+    return reply if isinstance(reply, dict) else None
+
+
 def _tool_fn(acceptor, name, kind, cancel, on_call=None):
-    """One passthrough tool body, closing over the command it dispatches. Pydantic AI builds
-    the tool's schema from this signature — a single optional `args` object. `on_call` (if given)
-    is invoked the moment the command fires, so the GUI can stream the activity live. Dispatch
-    errors (out-of-range, busy) are returned to the model as data so it can self-correct, not raised."""
-    def _call(args: dict | None = None) -> str:
+    """One passthrough tool body, closing over the command it dispatches. The keyword arguments
+    ARE the command's wire args, so `move_absolute(targets={"x": 5000})` dispatches verbatim.
+    `on_call` (if given) is invoked the moment the command fires, so the GUI can stream the
+    activity live. Dispatch errors (out-of-range, busy) are returned to the model as data so it
+    can self-correct, not raised."""
+    def _call(**args) -> str:
         """See the tool description (the command's hint)."""
         if on_call is not None:
             try:
@@ -85,19 +105,31 @@ def _tool_fn(acceptor, name, kind, cancel, on_call=None):
             return json.dumps(dispatch_and_wait(acceptor, name, args, kind, cancel))
         except Exception as error:
             code, message = error_info(error)
-            return json.dumps({"error": {"code": code, "message": message}})
+            failure = {"error": {"code": code, "message": message}}
+            if code == "validation":
+                options = _configured_options(acceptor)
+                if options is not None:
+                    failure["error"]["configured_options"] = options
+            return json.dumps(failure)
     return _call
 
 
 def build_tools(acceptor, cancel, on_call=None):
-    """One untyped passthrough tool per command, minus the prompt-only ones (get_manual is already in
-    the system prompt). The tool list otherwise IS COMMANDS — never hand-maintained. Per-arg
-    correctness comes from each command's accept() validator. NOTE (bench risk #1): untyped args →
-    nested commands may mis-fire; Tool.from_schema is the upgrade if so."""
+    """One passthrough tool per command, minus the prompt-only ones (get_manual is already in the
+    system prompt). The tool list otherwise IS COMMANDS — never hand-maintained. Per-arg
+    correctness comes from each command's accept() validator, the same one every transport uses.
+
+    The schema is an OPEN object rather than one inferred from the wrapper's signature. Inferring
+    it wrapped every command in an `args` envelope and set additionalProperties=false, so a model
+    emitting the correct wire call — move_absolute {"targets": {"x": 5000}} — was rejected by the
+    tool layer as `extra_forbidden` and never reached the dispatcher at all: every nested command
+    was unreachable. from_schema also skips pydantic's own validation, which keeps accept() the
+    single place a call can be refused instead of splitting rejection across two layers with two
+    different error vocabularies."""
     from pydantic_ai import Tool
     return [
-        Tool(_tool_fn(acceptor, name, cmd.kind, cancel, on_call),
-             takes_ctx=False, name=name, description=cmd.hint or name)
+        Tool.from_schema(_tool_fn(acceptor, name, cmd.kind, cancel, on_call),
+                         name=name, description=cmd.hint or name, json_schema=_ARGS_SCHEMA)
         for name, cmd in COMMANDS.items() if name not in _PROMPT_ONLY
     ]
 
@@ -136,11 +168,13 @@ def build_model():
     return FallbackModel(primary, _build_one(fallback))
 
 
-def build_agent(acceptor, cancel, on_call=None):
+def build_agent(acceptor, cancel, on_call=None, model=None):
+    """`model` overrides the configured endpoint — the GUI never passes it; the offline eval
+    harness uses it to drive the very same agent against a scripted model."""
     from pydantic_ai import Agent
     # instructions (not system_prompt): applied fresh each run, not accumulated into the
     # message history we carry across turns.
-    return Agent(build_model(), instructions=build_system_prompt(acceptor),
+    return Agent(model or build_model(), instructions=build_system_prompt(acceptor),
                  tools=build_tools(acceptor, cancel, on_call))
 
 

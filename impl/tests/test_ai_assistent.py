@@ -130,10 +130,38 @@ def test_tool_fn_streams_call_before_dispatch():
     acc = FakeAcceptor()
     seen = []
     tool = ai._tool_fn(acc, "get_state", READ, threading.Event(), on_call=lambda n, a: seen.append((n, a)))
-    out = tool({"foo": 1})
+    out = tool(foo=1)                                           # keywords ARE the wire args
     assert seen == [("get_state", json.dumps({"foo": 1}))]      # surfaced live, at the tool boundary
     assert ("get_state", {"foo": 1}) in acc.calls               # then dispatched
     assert "accepted" in out
+
+
+def test_validation_error_carries_the_configured_vocabulary():
+    """A type-only refusal ("'zoom' must be a string") tells the model nothing about which zooms
+    exist, so it asks the operator instead of retrying. The vocabulary rides along on every
+    validation failure; other failures stay lean."""
+    from mesoSPIM.src.mesoSPIM_RemoteControl_Dispatcher import ValidationError
+
+    class Refusing:
+        def __init__(self, error):
+            self.error = error
+            self.calls = []
+
+        def dispatch(self, name, args):
+            self.calls.append((name, args))
+            if name == "get_config":
+                return {"zooms": ["1x", "2x"]}
+            raise self.error
+
+    acc = Refusing(ValidationError("'zoom' must be a string"))
+    out = json.loads(ai._tool_fn(acc, "set_zoom", READ, threading.Event())(zoom=2))
+    assert out["error"]["configured_options"] == {"zooms": ["1x", "2x"]}
+    assert ("get_config", {}) in acc.calls
+
+    busy = Refusing(RuntimeError("boom"))
+    lean = json.loads(ai._tool_fn(busy, "set_zoom", READ, threading.Event())(zoom=2))
+    assert "configured_options" not in lean["error"]
+    assert ("get_config", {}) not in busy.calls               # only a value refusal pays for the read
 
 
 def test_run_turn_error_emits_sig_error(monkeypatch):
