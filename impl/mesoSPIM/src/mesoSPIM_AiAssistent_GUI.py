@@ -1,10 +1,10 @@
 """The 'AI Assistant' tab: a chat transcript styled like a coding-agent chat.
 
-Each turn is a bubble with a slightly lighter background: your question, then a mesoSPIM bubble that
-shows its header immediately and streams the commands it runs underneath, before the final Markdown
-answer. Enter submits; the input disables during a turn (single-flight); Interrupt halts a runaway
-agent. The Acceptor is acquired lazily on first use — until then the Remote Control transports stay
-usable, and the two are mutually exclusive.
+The transcript is plain on the tab's own background — no bubbles and no speaker labels, so weight
+alone separates the voices: your question is bold, the answer is not. Each answer streams the
+commands it runs above it, then the final Markdown. Enter submits; the input disables during a turn
+(single-flight); Interrupt halts a runaway agent. The Acceptor is acquired lazily on first use —
+until then the Remote Control transports stay usable, and the two are mutually exclusive.
 
 Maintainer (2026):
     Thom de Hoog
@@ -19,7 +19,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .mesoSPIM_AiAssistent import AssistantWorker
 
-_BUBBLE = "#2b3b47"      # a shade lighter than the dark theme, so questions and answers stand out
+_BUBBLE = "#2b3b47"      # the operator's own turns only — the answers stay on the tab background
 _DIM = "#9aa7b0"         # tool-call and note text
 
 
@@ -118,16 +118,21 @@ class AiAssistentGUI(QtWidgets.QWidget):
         row.addWidget(self.interrupt)
         layout.addLayout(row)
 
-    # --- transcript rendering (HTML bubbles) ---
-    def _bubble(self, inner):
-        return (f'<table width="100%" cellspacing="0" cellpadding="8" style="margin:3px 0;">'
-                f'<tr><td style="background-color:{_BUBBLE};">{inner}</td></tr></table>')
-
+    # --- transcript rendering ---
     def _user_block(self, text):
-        return self._bubble(f'<b>You</b><br>{_htmllib.escape(text)}')
+        """The question, bold on its own lighter panel. Only the operator's turns are panelled, so
+        the transcript reads as the microscope answering into your log rather than as two
+        symmetrical speakers — which is also what makes the 'You' label unnecessary."""
+        return ('<table width="100%" cellspacing="0" cellpadding="8" style="margin:14px 0 2px 0;">'
+                f'<tr><td style="background-color:{_BUBBLE};">'
+                f'<b>{_htmllib.escape(text)}</b></td></tr></table>')
 
     def _assistant_block(self, active):
-        parts = ['<b>mesoSPIM</b>']
+        """The answer, unbolded and unpanelled, under the commands it ran. The left margin lines it
+        up with the question text inside the panel above rather than with the panel's edge. Nothing
+        is emitted until the first tool call or the reply arrives — the status line already says the
+        turn is running."""
+        parts = []
         for name, args in active["tools"]:
             parts.append(f'<div style="color:{_DIM};">&#8250; {_htmllib.escape(name)}'
                          f'({_htmllib.escape(args)})</div>')
@@ -136,7 +141,7 @@ class AiAssistentGUI(QtWidgets.QWidget):
                          f'{_htmllib.escape(active["error"])}</div>')
         elif active["reply"] is not None:
             parts.append(_md_to_html(active["reply"]))
-        return self._bubble("".join(parts))
+        return f'<div style="margin:2px 0 16px 8px;">{"".join(parts)}</div>'
 
     def _note_block(self, text):
         return f'<div style="color:{_DIM};margin:3px 0;"><i>{_htmllib.escape(text)}</i></div>'

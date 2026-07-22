@@ -174,6 +174,26 @@ def test_run_turn_error_emits_sig_error(monkeypatch):
     assert len(dones) == 1                                        # sig_done fires even on failure
 
 
+def test_error_message_names_the_type_even_when_blank():
+    """An httpx read timeout stringifies to "", which rendered as a bare "error —" in the tab and
+    told the operator nothing. The type always leads."""
+    class Blank(Exception):
+        def __str__(self):
+            return "   "
+
+    assert ai.describe_error(Blank()) == "Blank"
+    assert ai.describe_error(ValueError("bad axis")) == "ValueError: bad axis"
+
+
+def test_run_turn_reports_a_blank_error_with_its_type(monkeypatch):
+    worker = AssistantWorker(FakeAcceptor())
+    monkeypatch.setattr(ai, "build_agent",
+                        lambda a, c, on_call=None, model=None: FakeAgent(errors=[TimeoutError()]))
+    errors = _collect(worker.sig_error)
+    worker.run_turn("go")
+    assert errors == ["TimeoutError"]
+
+
 def test_interrupt_sets_cancel_and_stops():
     acc = FakeAcceptor()
     worker = AssistantWorker(acc)

@@ -72,6 +72,17 @@ def dispatch_and_wait(acceptor, name, args, kind, cancel, cfg=config):
             "note": "operation exceeds the wait cap; call get_progress to check on it."}
 
 
+def describe_error(error):
+    """A turn failure the operator can act on.
+
+    Client transport failures often carry no message at all — an httpx read timeout stringifies to
+    "" — and the tab then renders a bare "error —" with nothing after it, which is
+    indistinguishable from the assistant having said nothing. Lead with the exception type so the
+    line always names what went wrong; run_turn logs the traceback alongside it."""
+    text = str(error).strip()
+    return f"{type(error).__name__}: {text}" if text else type(error).__name__
+
+
 def _configured_options(acceptor):
     """The instrument's own vocabulary, fetched only after a call was refused on its values.
 
@@ -242,7 +253,8 @@ class AssistantWorker(QtCore.QObject):
             self._history = result.all_messages()
             self.sig_reply.emit(result.output)
         except Exception as error:
-            self.sig_error.emit(str(error))
+            logger.exception("AI Assistant turn failed")
+            self.sig_error.emit(describe_error(error))
         finally:
             self.sig_done.emit()
 
