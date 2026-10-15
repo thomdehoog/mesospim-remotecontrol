@@ -814,7 +814,7 @@ close the listener, clear the reference.
 ## 4.0 The module docstring — make the extension point explicit
 
 This module is the one a future maintainer will come to when they want to *add* something. Say how,
-at the top, so they do not have to reverse-engineer it:
+at the top, so they do not have to work it out:
 
 ```python
 """Remote-control command vocabulary and execution.

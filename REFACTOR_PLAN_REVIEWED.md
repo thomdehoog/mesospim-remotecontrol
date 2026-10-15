@@ -68,8 +68,8 @@ same as clean.
   hide behaviour. A reader must be able to see what a command does without unwrapping an abstraction.
 - **Extension must be obvious.** Adding a command is: write `_handler(core, args)`, add one `COMMANDS`
   entry, add one `_HINTS` entry, add one `VALID_CASES` entry in `tests/support/contracts.py`. State
-  that sequence in the command module's docstring so the next person does not have to reverse-engineer
-  it. Nothing in this refactor may make that sequence longer or less obvious.
+  that sequence in the command module's docstring so the next person does not have to work
+  it out. Nothing in this refactor may make that sequence longer or less obvious.
 - **No bloat.** The above is not licence to pad. Delete dead code, collapse true duplication, and then
   document what remains properly.
 
